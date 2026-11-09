@@ -1,8 +1,8 @@
 name: Build vica-laya runtime
 
-# Builds the vica-laya runner from the ggmlc snapshot in ggmlc/ for three platforms.
-# Every run checks the binary on CPU with the published model; a `v*` tag also attaches
-# the archives and SHA256SUMS to a GitHub release.
+# Builds the vica-laya runner from the ggmlc snapshot in ggmlc/ for three platforms, checks it
+# on CPU with the published model, and packs one download per platform: runner + vica-laya.gguf
+# + licenses. A `v*` tag also attaches the packages and SHA256SUMS to a GitHub release.
 on:
   workflow_dispatch:
   push:
@@ -13,7 +13,8 @@ permissions:
   contents: write
 
 env:
-  # Published model used only for the CPU check. Pin a Hugging Face commit, not main.
+  # Published model release. Pin a Hugging Face commit, not main.
+  MODEL_RELEASE: "2026.11.08.1"
   MODEL_URL: https://huggingface.co/tory-labs/vica-laya/resolve/a476161f88e8f91737533595168e85d09dcb8e14/laya_multilingual_q8_0.gguf
   MODEL_SHA256: ba398461a6181e68350d0a88cf7885f53925ce440d2e97f3ea0096e4d8d9a721
   CHECK_FILES: https://huggingface.co/tory-labs/vica-laya/resolve/a476161f88e8f91737533595168e85d09dcb8e14
@@ -26,9 +27,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # flags: the shipped build. reference_flags: the previous upstream-style build, kept only
-          # to compare answers and CPU speed. Portable builds drop OpenMP (VCOMP140 / libgomp) and
-          # link the C/C++ runtime statically (MSVCP140 / VCRUNTIME140, libstdc++ / libgcc_s).
+          # flags: the shipped build. reference_flags: the upstream-style build, kept only to compare
+          # answers and CPU speed. Linux and Windows drop OpenMP (libgomp / VCOMP140). Linux links
+          # libstdc++ / libgcc statically. Windows keeps the shared MSVC runtime and ships its DLLs
+          # next to the exe: a static MSVC runtime changed CPU probabilities by up to 0.032.
           - name: macos-arm64
             os: macos-15
             flags: -DGGMLC_ENABLE_METAL=ON -DGGML_NATIVE=OFF
@@ -39,7 +41,7 @@ jobs:
             reference_flags: -DGGMLC_ENABLE_VULKAN=ON
           - name: windows-x86_64
             os: windows-2022
-            flags: -DGGMLC_ENABLE_VULKAN=ON -DGGML_OPENMP=OFF -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+            flags: -DGGMLC_ENABLE_VULKAN=ON -DGGML_OPENMP=OFF
             reference_flags: -DGGMLC_ENABLE_VULKAN=ON
 
     steps:
@@ -122,54 +124,89 @@ jobs:
           python scripts/check_runtime.py "$EXE" check/model.gguf check/example-state.json check/topic-questions.json \
             "check/check-${{ matrix.name }}.json" ${REF:+--reference "$REF"}
 
-      # Temporary: find which Windows flag changes the CPU numbers.
-      - name: Diagnose Windows flags
-        if: always() && runner.os == 'Windows'
-        continue-on-error: true
-        shell: pwsh
-        run: |
-          $common = "-DCMAKE_BUILD_TYPE=Release", "-DGGMLC_BUILD_EXAMPLES=ON", "-DGGMLC_ENABLE_VULKAN=ON"
-          cmake -S ggmlc -B build-omp -G Ninja @common -DGGML_OPENMP=OFF; if ($LASTEXITCODE) { exit 1 }
-          cmake --build build-omp --target laya; if ($LASTEXITCODE) { exit 1 }
-          cmake -S ggmlc -B build-crt -G Ninja @common -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded; if ($LASTEXITCODE) { exit 1 }
-          cmake --build build-crt --target laya; if ($LASTEXITCODE) { exit 1 }
-          python scripts/check_runtime.py build-omp/examples/laya/laya.exe check/model.gguf check/example-state.json check/topic-questions.json check/check-windows-openmp-off-only.json --reference build-ref/examples/laya/laya.exe
-          python scripts/check_runtime.py build-crt/examples/laya/laya.exe check/model.gguf check/example-state.json check/topic-questions.json check/check-windows-static-crt-only.json --reference build-ref/examples/laya/laya.exe
-
-      - name: Package (Unix)
-        if: runner.os != 'Windows'
-        run: |
-          mkdir -p dist
-          tar -czvf "dist/vica-laya-runtime-${{ matrix.name }}.tar.gz" -C out vica-laya
-
-      - name: Package (Windows)
+      - name: Add MSVC runtime DLLs (Windows)
         if: runner.os == 'Windows'
         run: |
-          New-Item -ItemType Directory -Force -Path dist
-          Compress-Archive -Path out\vica-laya.exe -DestinationPath "dist\vica-laya-runtime-${{ matrix.name }}.zip"
+          $crt = Get-ChildItem "$env:VCToolsRedistDir\x64" -Directory -Filter "Microsoft.VC*.CRT" | Select-Object -First 1
+          Copy-Item "$($crt.FullName)\msvcp140.dll", "$($crt.FullName)\vcruntime140.dll", "$($crt.FullName)\vcruntime140_1.dll" out\
+          Get-ChildItem out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runtime-${{ matrix.name }}
+          path: out/*
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: vica-laya-runtime-${{ matrix.name }}
-          path: |
-            dist/*
-            check/check-*.json
+          name: check-${{ matrix.name }}
+          path: check/check-*.json
 
-  release:
-    name: Attach to release
+  package:
+    name: Package vica-laya
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - uses: actions/download-artifact@v4
         with:
-          path: artifacts
-          merge-multiple: true
-      - name: Checksums
+          pattern: runtime-*
+          path: runtime
+
+      - name: Rename the model to vica-laya
         run: |
-          mkdir dist && cp artifacts/dist/* dist/
-          cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+          pip install gguf==0.19.0
+          curl -sSL -o original.gguf "$MODEL_URL"
+          echo "$MODEL_SHA256  original.gguf" | sha256sum -c -
+          python scripts/rename_gguf.py original.gguf vica-laya.gguf "tory-labs/vica-laya@$MODEL_RELEASE"
+          curl -sSL -o LICENSE "$CHECK_FILES/LICENSE"
+          curl -sSL -o NOTICE "$CHECK_FILES/NOTICE"
+
+      - name: Check the renamed model with the Linux runner
+        run: |
+          chmod +x runtime/runtime-linux-x86_64/vica-laya
+          curl -sSL -o state.json "$CHECK_FILES/example-state.json"
+          curl -sSL -o questions.json "$CHECK_FILES/topic-questions.json"
+          for m in original vica-laya; do
+            runtime/runtime-linux-x86_64/vica-laya decide $m.gguf --json --device cpu --state-file state.json --questions-file questions.json > $m.json
+          done
+          python - <<'PY'
+          import json
+          a, b = (json.load(open(f)) for f in ("original.json", "vica-laya.json"))
+          assert a["answers"] == b["answers"], "answers changed"
+          assert b["model"] == "vica-laya", b["model"]
+          print("renamed model: same answers, model =", b["model"])
+          PY
+
+      - name: Pack one download per platform
+        run: |
+          mkdir dist
+          for p in macos-arm64 linux-x86_64 windows-x86_64; do
+            d=pack/$p/vica-laya
+            mkdir -p $d
+            cp runtime/runtime-$p/* $d/
+            ln vica-laya.gguf $d/vica-laya.gguf
+            cp LICENSE NOTICE licenses/THIRD_PARTY_LICENSES.txt $d/
+            if [ $p = windows-x86_64 ]; then
+              (cd pack/$p && zip -r -X ../../dist/vica-laya-$p.zip vica-laya)
+            else
+              chmod +x $d/vica-laya
+              tar -czf dist/vica-laya-$p.tar.gz -C pack/$p vica-laya
+            fi
+          done
+          cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS && ls -la
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vica-laya
+          path: dist/*
+
       - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/v')
         with:
           files: dist/*

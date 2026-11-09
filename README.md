@@ -1,24 +1,28 @@
 # vica-laya runtime
 
-Build source for the `vica-laya` runner, the standalone program that runs the Vica Laya model
-(`tory-labs/vica-laya` on Hugging Face). Users download the runner and the model from Hugging Face;
-this repository only builds the runner.
+Build source for `vica-laya`, the standalone program that runs the Vica Laya model. Each platform
+gets one download that holds the program, the model `vica-laya.gguf` and the license files. The
+downloads are published with the model on Hugging Face (`tory-labs/vica-laya`).
 
-| Platform | GPU backend | Archive |
-|---|---|---|
-| macOS arm64 | Metal | `vica-laya-runtime-macos-arm64.tar.gz` |
-| Linux x86_64 | Vulkan | `vica-laya-runtime-linux-x86_64.tar.gz` |
-| Windows x86_64 | Vulkan | `vica-laya-runtime-windows-x86_64.zip` |
+| Platform | GPU backend | Download | Needs on the computer |
+|---|---|---|---|
+| macOS arm64 | Metal | `vica-laya-macos-arm64.tar.gz` | nothing else |
+| Linux x86_64 | Vulkan | `vica-laya-linux-x86_64.tar.gz` | Vulkan loader (`libvulkan.so.1`); built on Ubuntu 22.04 (glibc 2.35) |
+| Windows x86_64 | Vulkan | `vica-laya-windows-x86_64.zip` | Vulkan loader (`vulkan-1.dll`, installed with GPU drivers) |
 
-`--device auto` uses the GPU when one is available and falls back to CPU otherwise.
+`--device auto` uses the GPU when one is available and falls back to CPU otherwise. The Windows
+download carries the Microsoft Visual C++ runtime DLLs next to `vica-laya.exe`.
 
 ## Build
 
-GitHub Actions (`.github/workflows/build.yml`) builds all three platforms. Linux and Windows builds
-drop OpenMP and link the C/C++ runtime statically, so they need only operating-system libraries and the
-Vulkan loader, which GPU drivers install. Each run checks fixed CPU decisions and CPU speed against an
-upstream-style reference build with the published model, and keeps the archives as workflow
-artifacts. Pushing a `v*` tag also attaches them with `SHA256SUMS` to a GitHub release.
+GitHub Actions (`.github/workflows/build.yml`) builds the three platforms, renames the published
+model to `vica-laya`, and packs the downloads with `SHA256SUMS` as workflow artifacts. Pushing a `v*`
+tag also attaches them to a GitHub release.
+
+Linux and Windows builds drop OpenMP; Linux also links libstdc++ and libgcc statically. Windows keeps
+the shared Visual C++ runtime because a static one changed CPU probabilities by up to 0.032. Each run
+compares fixed CPU decisions and CPU speed with an upstream-style reference build; any changed
+decision fails the run.
 
 Local build (macOS; Linux and Windows flags are in the workflow matrix):
 
