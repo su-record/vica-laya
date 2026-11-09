@@ -14,11 +14,13 @@ this repository only builds the runner.
 
 ## Build
 
-GitHub Actions (`.github/workflows/build.yml`) builds all three platforms, runs a CPU decision with
-the published model, and keeps the archives as workflow artifacts. Pushing a `v*` tag also attaches
-them with `SHA256SUMS` to a GitHub release.
+GitHub Actions (`.github/workflows/build.yml`) builds all three platforms. Linux and Windows builds
+drop OpenMP and link the C/C++ runtime statically, so they need only operating-system libraries and the
+Vulkan loader, which GPU drivers install. Each run checks fixed CPU decisions and CPU speed against an
+upstream-style reference build with the published model, and keeps the archives as workflow
+artifacts. Pushing a `v*` tag also attaches them with `SHA256SUMS` to a GitHub release.
 
-Local build (macOS):
+Local build (macOS; Linux and Windows flags are in the workflow matrix):
 
 ```sh
 cmake -S ggmlc -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGMLC_ENABLE_METAL=ON -DGGML_NATIVE=OFF -DGGMLC_BUILD_EXAMPLES=ON

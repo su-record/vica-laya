@@ -26,21 +26,31 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # flags: the shipped build. reference_flags: the previous upstream-style build, kept only
+          # to compare answers and CPU speed. Portable builds drop OpenMP (VCOMP140 / libgomp) and
+          # link the C/C++ runtime statically (MSVCP140 / VCRUNTIME140, libstdc++ / libgcc_s).
           - name: macos-arm64
             os: macos-15
-            backend: metal
+            flags: -DGGMLC_ENABLE_METAL=ON -DGGML_NATIVE=OFF
+            reference_flags: ""
           - name: linux-x86_64
             os: ubuntu-22.04
-            backend: vulkan
+            flags: -DGGMLC_ENABLE_VULKAN=ON -DGGML_OPENMP=OFF "-DCMAKE_EXE_LINKER_FLAGS=-static-libstdc++ -static-libgcc"
+            reference_flags: -DGGMLC_ENABLE_VULKAN=ON
           - name: windows-x86_64
             os: windows-2022
-            backend: vulkan
+            flags: -DGGMLC_ENABLE_VULKAN=ON -DGGML_OPENMP=OFF -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+            reference_flags: -DGGMLC_ENABLE_VULKAN=ON
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up Ninja
         uses: ashutoshvarma/setup-ninja@master
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
       - name: Set up MSVC (Windows)
         if: runner.os == 'Windows'
@@ -64,16 +74,19 @@ jobs:
           Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
           Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
 
-      - name: Configure (macOS Metal)
-        if: matrix.backend == 'metal'
-        run: cmake -S ggmlc -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGMLC_ENABLE_METAL=ON -DGGML_NATIVE=OFF -DGGMLC_BUILD_EXAMPLES=ON
-
-      - name: Configure (Vulkan)
-        if: matrix.backend == 'vulkan'
-        run: cmake -S ggmlc -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGMLC_ENABLE_VULKAN=ON -DGGMLC_BUILD_EXAMPLES=ON
+      - name: Configure
+        run: cmake -S ggmlc -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGMLC_BUILD_EXAMPLES=ON ${{ matrix.flags }}
 
       - name: Build
         run: cmake --build build --config Release --target laya
+
+      - name: Configure reference
+        if: matrix.reference_flags != ''
+        run: cmake -S ggmlc -B build-ref -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGMLC_BUILD_EXAMPLES=ON ${{ matrix.reference_flags }}
+
+      - name: Build reference
+        if: matrix.reference_flags != ''
+        run: cmake --build build-ref --config Release --target laya
 
       - name: Name the binary vica-laya
         shell: bash
@@ -81,9 +94,12 @@ jobs:
           mkdir -p out
           if [ -f build/examples/laya/laya.exe ]; then
             cp build/examples/laya/laya.exe out/vica-laya.exe; echo "EXE=out/vica-laya.exe" >> "$GITHUB_ENV"
+            [ -f build-ref/examples/laya/laya.exe ] && echo "REF=build-ref/examples/laya/laya.exe" >> "$GITHUB_ENV"
           else
             cp build/examples/laya/laya out/vica-laya; echo "EXE=out/vica-laya" >> "$GITHUB_ENV"
+            [ -f build-ref/examples/laya/laya ] && echo "REF=build-ref/examples/laya/laya" >> "$GITHUB_ENV"
           fi
+          true
 
       - name: Show linked libraries
         continue-on-error: true
@@ -103,10 +119,8 @@ jobs:
           echo "$MODEL_SHA256  check/model.gguf" | sha256sum -c - 2>/dev/null || echo "$MODEL_SHA256  check/model.gguf" | shasum -a 256 -c -
           curl -sSL -o check/example-state.json "$CHECK_FILES/example-state.json"
           curl -sSL -o check/topic-questions.json "$CHECK_FILES/topic-questions.json"
-          "$EXE" decide check/model.gguf --json --device cpu \
-            --state-file check/example-state.json --questions-file check/topic-questions.json \
-            > "check/decide-${{ matrix.name }}-cpu.json"
-          cat "check/decide-${{ matrix.name }}-cpu.json"
+          python scripts/check_runtime.py "$EXE" check/model.gguf check/example-state.json check/topic-questions.json \
+            "check/check-${{ matrix.name }}.json" ${REF:+--reference "$REF"}
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
@@ -125,7 +139,7 @@ jobs:
           name: vica-laya-runtime-${{ matrix.name }}
           path: |
             dist/*
-            check/decide-*.json
+            check/check-*.json
 
   release:
     name: Attach to release
