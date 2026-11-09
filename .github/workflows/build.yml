@@ -122,6 +122,20 @@ jobs:
           python scripts/check_runtime.py "$EXE" check/model.gguf check/example-state.json check/topic-questions.json \
             "check/check-${{ matrix.name }}.json" ${REF:+--reference "$REF"}
 
+      # Temporary: find which Windows flag changes the CPU numbers.
+      - name: Diagnose Windows flags
+        if: always() && runner.os == 'Windows'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $common = "-DCMAKE_BUILD_TYPE=Release", "-DGGMLC_BUILD_EXAMPLES=ON", "-DGGMLC_ENABLE_VULKAN=ON"
+          cmake -S ggmlc -B build-omp -G Ninja @common -DGGML_OPENMP=OFF; if ($LASTEXITCODE) { exit 1 }
+          cmake --build build-omp --target laya; if ($LASTEXITCODE) { exit 1 }
+          cmake -S ggmlc -B build-crt -G Ninja @common -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded; if ($LASTEXITCODE) { exit 1 }
+          cmake --build build-crt --target laya; if ($LASTEXITCODE) { exit 1 }
+          python scripts/check_runtime.py build-omp/examples/laya/laya.exe check/model.gguf check/example-state.json check/topic-questions.json check/check-windows-openmp-off-only.json --reference build-ref/examples/laya/laya.exe
+          python scripts/check_runtime.py build-crt/examples/laya/laya.exe check/model.gguf check/example-state.json check/topic-questions.json check/check-windows-static-crt-only.json --reference build-ref/examples/laya/laya.exe
+
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
@@ -135,6 +149,7 @@ jobs:
           Compress-Archive -Path out\vica-laya.exe -DestinationPath "dist\vica-laya-runtime-${{ matrix.name }}.zip"
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: vica-laya-runtime-${{ matrix.name }}
           path: |

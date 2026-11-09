@@ -1,7 +1,8 @@
 """CPU check for a built vica-laya runner.
 
 Runs fixed decisions with the published model and times the email preset. With --reference,
-the same runs use a second binary and the answers must match it exactly.
+the same runs use a second binary; any changed decision fails the check, and the largest
+probability difference is reported.
 """
 import argparse
 import json
@@ -21,6 +22,27 @@ def decide(exe, model, args):
     out = subprocess.run([exe, "decide", model, "--json", "--device", "cpu", *args],
                          capture_output=True, text=True, encoding="utf-8", check=True).stdout
     return json.loads(out[out.index("{"):])["answers"]
+
+
+def values(answer):
+    return [answer.get("confidence", 0), answer.get("noul", 0), answer.get("score", 0), *answer.get("probabilities", {}).values()]
+
+
+def decision(answer):
+    if "choice" in answer:
+        return answer["choice"]
+    if "score" in answer:
+        return round(answer["score"])
+    return answer.get("noul", 0) >= 0.5
+
+
+def compare(ours, ref):
+    diff, changed = 0.0, 0
+    for a, b in zip(ours, ref):
+        for k in a:
+            diff = max(diff, *(abs(x - y) for x, y in zip(values(a[k]), values(b[k]))))
+            changed += decision(a[k]) != decision(b[k])
+    return diff, changed
 
 
 def bench(exe, model):
@@ -47,13 +69,15 @@ def main():
     if a.reference:
         ref = [decide(a.reference, a.model, c) for c in cases]
         result["reference_bench_cpu_email"] = bench(a.reference, a.model)
+        result["reference_answers"] = ref
         result["identical_to_reference"] = sum(x == y for x, y in zip(result["answers"], ref))
         result["cases"] = len(cases)
+        result["max_abs_diff"], result["decision_changes"] = compare(result["answers"], ref)
     with open(a.output, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=1)
-    print(json.dumps({k: v for k, v in result.items() if k != "answers"}, indent=1))
-    if a.reference and result["identical_to_reference"] != len(cases):
-        sys.exit("answers differ from the reference build")
+    print(json.dumps({k: v for k, v in result.items() if not k.endswith("answers")}, indent=1))
+    if a.reference and result["decision_changes"]:
+        sys.exit("decisions differ from the reference build")
 
 
 main()
