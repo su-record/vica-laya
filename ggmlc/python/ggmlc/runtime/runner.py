@@ -1,0 +1,334 @@
+"""High-performance Python runtime interface for ggmlc models."""
+
+from __future__ import annotations
+
+import struct
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+try:
+    from ggmlc import _runtime
+
+    _RUNTIME_AVAILABLE = True
+except ImportError:
+    _runtime = None
+    _RUNTIME_AVAILABLE = False
+
+from ggmlc.dialect.ggml.ops import GGMLType
+from ggmlc.serialization.gguf import deserialize_ggml_graph
+
+# Map GGMLType integer values to numpy dtypes
+GGML_TYPE_TO_NUMPY: dict[int, np.dtype] = {
+    int(GGMLType.GGML_TYPE_F32): np.dtype(np.float32),
+    int(GGMLType.GGML_TYPE_F16): np.dtype(np.float16),
+    int(GGMLType.GGML_TYPE_I8): np.dtype(np.int8),
+    int(GGMLType.GGML_TYPE_I16): np.dtype(np.int16),
+    int(GGMLType.GGML_TYPE_I32): np.dtype(np.int32),
+    int(GGMLType.GGML_TYPE_I64): np.dtype(np.int64),
+    int(GGMLType.GGML_TYPE_F64): np.dtype(np.float64),
+}
+
+
+def get_available_devices() -> list[str]:
+    """Returns a list of hardware execution devices supported by the runtime (e.g. ['cpu', 'cuda:0'])."""
+    if _RUNTIME_AVAILABLE and hasattr(_runtime, "get_available_devices"):
+        return list(_runtime.get_available_devices())
+    return ["cpu"]
+
+
+class ModelRunner:
+    """Zero-dependency high-performance runner for compiled GGUF models.
+
+    Wraps the native nanobind C++ execution engine for in-memory model evaluation
+    with zero-copy numpy buffers, device placement (CPU, CUDA), and multi-threading.
+    """
+
+    def __init__(
+        self,
+        model_source: str | Path | bytes,
+        n_threads: int = 1,
+        device: str = "cpu",
+    ) -> None:
+        if not _RUNTIME_AVAILABLE:
+            raise RuntimeError(
+                "Native ggmlc C++ runtime extension '_runtime' is not available. "
+                "Build it using 'cmake --build build-win --target _runtime' (Windows) "
+                "or 'cmake --build build --target _runtime' (Linux)."
+            )
+
+        self.n_threads = n_threads
+
+        self.py_graph = None
+        if isinstance(model_source, (str, Path)):
+            p = Path(model_source).resolve()
+            if not p.exists():
+                raise FileNotFoundError(f"Model file not found: {p}")
+            self.graph = _runtime.ModelLoader.load_from_file(str(p))
+        elif isinstance(model_source, (bytes, bytearray)):
+            raw_bytes = bytes(model_source)
+            self.graph = _runtime.ModelLoader.load_from_bytes(raw_bytes)
+            try:
+                self.py_graph = deserialize_ggml_graph(raw_bytes)
+            except (ValueError, KeyError, struct.error, OSError):
+                self.py_graph = None
+            finally:
+                del raw_bytes
+        else:
+            raise TypeError(f"Expected file path or bytes, got {type(model_source)}")
+
+        self.executor = _runtime.ModelExecutor(self.graph, device)
+        self.device = getattr(self.executor, "device", device)
+        self.name = self.graph.name
+        self.symbol_table = list(self.graph.symbol_table)
+        self.inputs = list(self.graph.inputs)
+        self.outputs = list(self.graph.outputs)
+        self.parameters = list(self.graph.parameters)
+
+        # Build name to ID maps
+        self.input_name_to_id: dict[str, int] = {}
+        self.tensor_info: dict[int, Any] = {}
+        for tid, t in self.graph.tensors.items():
+            self.tensor_info[tid] = t
+            if tid in self.inputs:
+                self.input_name_to_id[t.name] = tid
+
+    def __call__(
+        self,
+        *args: np.ndarray,
+        symbols: dict[str, int] | None = None,
+        n_threads: int | None = None,
+        enable_arena_reuse: bool = True,
+        **kwargs: np.ndarray,
+    ) -> np.ndarray | dict[str | int, np.ndarray]:
+        """Runs model inference synchronously on input tensors.
+
+        Args:
+            *args: Positional input arrays (matched to graph inputs in order).
+            symbols: Optional dictionary of dynamic symbol values (e.g. {'seq_len': 32}).
+            n_threads: Number of CPU execution threads (defaults to self.n_threads).
+            enable_arena_reuse: Whether to use ggml_gallocr for activation arena reuse.
+            **kwargs: Named input arrays (matched to input tensor names).
+
+        Returns:
+            Computed output numpy array (if single output) or dict of outputs.
+        """
+        if len(args) == 1 and isinstance(args[0], dict) and not kwargs:
+            kwargs = args[0]
+            args = ()
+        threads = n_threads if n_threads is not None else self.n_threads
+        symbol_env: dict[str, int] = {}
+        if symbols:
+            symbol_env.update(symbols)
+
+        # Auto-deduce symbols from positional inputs using Python graph metadata
+        if self.py_graph:
+            for idx, arr in enumerate(args):
+                if idx < len(self.inputs):
+                    tid = self.inputs[idx]
+                    t = self.py_graph.tensors.get(tid)
+                    if t and hasattr(arr, "shape"):
+                        arr_shape = arr.shape
+                        for i, dim_obj in enumerate(t.ne):
+                            rm_idx = len(arr_shape) - 1 - i
+                            if 0 <= rm_idx < len(arr_shape):
+                                dim_val = arr_shape[rm_idx]
+                                for sym in dim_obj.free_symbols():
+                                    if sym not in symbol_env:
+                                        symbol_env[sym] = int(dim_val)
+
+        # GGUF-loaded graphs have no py_graph; bind GGML ne[i] -> numpy axis -1-i.
+        if args and self.symbol_table and hasattr(args[0], "shape"):
+            tid0 = self.inputs[0] if self.inputs else None
+            t0 = self.tensor_info.get(tid0) if tid0 is not None else None
+            if t0 is not None and hasattr(t0, "symbol_index"):
+                arr_shape = args[0].shape
+                for i in range(min(4, len(arr_shape))):
+                    sidx = int(t0.symbol_index(i))
+                    if 0 <= sidx < len(self.symbol_table):
+                        np_axis = len(arr_shape) - 1 - i
+                        name = self.symbol_table[sidx]
+                        if name not in symbol_env:
+                            symbol_env[name] = int(arr_shape[np_axis])
+
+        # Fallback if symbols passed and count matches symbol_table
+        if symbols and len(self.symbol_table) == len(symbols):
+            for reg_sym, val in zip(self.symbol_table, symbols.values()):
+                if reg_sym not in symbol_env:
+                    symbol_env[reg_sym] = int(val)
+
+        if "s" in symbol_env:
+            s_val = symbol_env["s"]
+            for sym in self.symbol_table:
+                if (sym.startswith("s") or "seq" in sym) and sym not in symbol_env:
+                    symbol_env[sym] = s_val
+            if len(self.symbol_table) == 1 and self.symbol_table[0] not in symbol_env:
+                symbol_env[self.symbol_table[0]] = s_val
+
+        # 1. Prepare context for dynamic symbols
+        self.executor.prepare(symbol_env, enable_arena_reuse)
+
+        # 2. Bind positional inputs
+        self._cached_inputs = []
+        for idx, arr in enumerate(args):
+            if idx >= len(self.inputs):
+                raise ValueError(
+                    f"Too many positional arguments: model expects {len(self.inputs)} inputs, got {len(args)}"
+                )
+            tid = self.inputs[idx]
+            t = self.tensor_info.get(tid)
+            arr_c = np.ascontiguousarray(arr)
+            if t and t.type == int(GGMLType.GGML_TYPE_I32) and arr_c.dtype == np.int64:
+                arr_c = arr_c.astype(np.int32)
+            self.executor.set_input_by_id(tid, arr_c)
+            self._cached_inputs.append((tid, arr_c))
+
+        # 3. Bind keyword inputs
+        for name, arr in kwargs.items():
+            arr_c = np.ascontiguousarray(arr)
+            if name in self.input_name_to_id:
+                tid = self.input_name_to_id[name]
+                t = self.tensor_info.get(tid)
+                if t and t.type == int(GGMLType.GGML_TYPE_I32) and arr_c.dtype == np.int64:
+                    arr_c = arr_c.astype(np.int32)
+                self.executor.set_input_by_id(tid, arr_c)
+                self._cached_inputs.append((tid, arr_c))
+            elif len(self.inputs) == 1 and len(kwargs) == 1:
+                tid = self.inputs[0]
+                t = self.tensor_info.get(tid)
+                if t and t.type == int(GGMLType.GGML_TYPE_I32) and arr_c.dtype == np.int64:
+                    arr_c = arr_c.astype(np.int32)
+                self.executor.set_input_by_id(tid, arr_c)
+                self._cached_inputs.append((tid, arr_c))
+            else:
+                self.executor.set_input_by_name(name, arr_c)
+
+        # 4. Execute forward graph
+        self.executor.run(threads)
+
+        # 5. Extract output tensors
+        input_ndim = (
+            args[0].ndim if len(args) > 0 else (next(iter(kwargs.values())).ndim if kwargs else 2)
+        )
+        return self.get_outputs(input_ndim=input_ndim)
+
+    def get_outputs(self, input_ndim: int = 2) -> np.ndarray | dict[str | int, np.ndarray]:
+        """Extracts output tensors from the executor without re-preparing the graph."""
+        results: dict[str | int, np.ndarray] = {}
+        for out_tid in self.outputs:
+            t = self.tensor_info.get(out_tid)
+            raw_bytes = self.executor.get_output_bytes(out_tid)
+            ne_shape = self.executor.get_tensor_shape(out_tid)
+
+            # Determine numpy dtype
+            dtype_val = t.type if t else 0
+            np_dtype = GGML_TYPE_TO_NUMPY.get(dtype_val, np.dtype(np.float32))
+
+            # ne is in GGML column-major order [ne0, ne1, ne2, ne3]
+            # Convert to PyTorch / C-contiguous row-major shape [ne3, ne2, ne1, ne0]
+            full_c_shape = [ne_shape[3], ne_shape[2], ne_shape[1], ne_shape[0]]
+            py_t = self.py_graph.tensors.get(out_tid) if self.py_graph else None
+            rank = getattr(py_t, "original_rank", None)
+            if rank is None or rank <= 0:
+                rank = max(2, input_ndim)
+            c_shape = full_c_shape[-rank:]
+
+            # Reconstruct numpy array
+            arr = np.frombuffer(raw_bytes, dtype=np_dtype)
+            try:
+                arr = arr.reshape(c_shape)
+            except ValueError:
+                pass
+
+            out_name = t.name if t else str(out_tid)
+            results[out_name] = arr
+            results[out_tid] = arr
+
+        if len(self.outputs) == 1:
+            return next(iter(results.values()))
+        return results
+
+    def run_benchmark(self, runs: int = 5, n_threads: int | None = None) -> list[float]:
+        """Measures pure graph execution time over repeated runs without D2H copies."""
+        import time
+
+        threads = n_threads if n_threads is not None else self.n_threads
+        latencies: list[float] = []
+        for _ in range(runs):
+            # Refresh input buffers before each run to ensure valid data on device
+            if hasattr(self, "_cached_inputs"):
+                for tid, arr_c in self._cached_inputs:
+                    self.executor.set_input_by_id(tid, arr_c)
+            t0 = time.perf_counter()
+            self.executor.run(threads)
+            t1 = time.perf_counter()
+            latencies.append((t1 - t0) * 1000.0)
+        return latencies
+
+    def set_state(self, state_name_or_id: str | int, array: np.ndarray) -> None:
+        """Sets data for a persistent state tensor by name or ID."""
+        arr_c = np.ascontiguousarray(array)
+        if isinstance(state_name_or_id, int):
+            self.executor.set_state_by_id(state_name_or_id, arr_c)
+        else:
+            self.executor.set_state_by_name(state_name_or_id, arr_c)
+
+    def get_state(self, state_name_or_id: str | int) -> np.ndarray:
+        """Retrieves data for a persistent state tensor by name or ID."""
+        if isinstance(state_name_or_id, int):
+            raw_bytes = self.executor.get_state_bytes(state_name_or_id)
+            t = self.tensor_info.get(state_name_or_id)
+        else:
+            tid = None
+            for k, v in self.tensor_info.items():
+                if v.name == state_name_or_id:
+                    tid = k
+                    break
+            if tid is not None:
+                raw_bytes = self.executor.get_state_bytes(tid)
+                t = self.tensor_info.get(tid)
+            else:
+                raw_bytes = self.executor.get_state_bytes_by_name(state_name_or_id)
+                t = None
+        dtype_val = t.type if t else 0
+        np_dtype = GGML_TYPE_TO_NUMPY.get(dtype_val, np.dtype(np.float32))
+        return np.frombuffer(raw_bytes, dtype=np_dtype)
+
+    def reset_state(self) -> None:
+        """Resets all persistent state buffers in the executor."""
+        self.executor.reset_state()
+
+    def init_kv_cache(self, max_ctx: int = 2048) -> None:
+        """Initializes hardware KV cache for autoregressive attention ops."""
+        if hasattr(self.executor, "init_kv_cache"):
+            self.executor.init_kv_cache(max_ctx)
+
+    def reset_kv_cache(self) -> None:
+        """Resets the KV cache memory to zeros."""
+        if hasattr(self.executor, "reset_kv_cache"):
+            self.executor.reset_kv_cache()
+
+    def has_kv_cache(self) -> bool:
+        """Returns True if the executor has active KV cache buffers."""
+        if hasattr(self.executor, "has_kv_cache"):
+            return bool(self.executor.has_kv_cache())
+        return False
+
+
+def load(
+    model_source: str | Path | bytes,
+    n_threads: int = 1,
+    device: str = "cpu",
+) -> ModelRunner:
+    """Loads a compiled GGUF model into a high-performance native runner.
+
+    Args:
+        model_source: Path to .gguf file or raw GGUF bytes.
+        n_threads: Number of CPU threads to use during execution.
+        device: Hardware device to execute on ("cpu", "cuda", "cuda:0", "auto").
+
+    Returns:
+        Instantiated ModelRunner instance.
+    """
+    return ModelRunner(model_source, n_threads=n_threads, device=device)

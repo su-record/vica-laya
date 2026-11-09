@@ -1,0 +1,236 @@
+name: Release Standalone Binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check_main:
+    name: Verify Tag is on Main Branch
+    runs-on: ubuntu-latest
+    outputs:
+      is_main: ${{ steps.check.outputs.is_main }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: check
+        name: Check if commit is on main
+        run: |
+          git fetch origin main
+          if git merge-base --is-ancestor HEAD origin/main; then
+            echo "Tag commit is on main branch."
+            echo "is_main=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Tag commit is NOT on main branch (feature branch tag). Skipping binary release."
+            echo "is_main=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build_binaries:
+    name: Build Binaries (${{ matrix.name }})
+    needs: [check_main]
+    if: needs.check_main.outputs.is_main == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-arm64-metal
+            os: macos-14
+            backend: metal
+
+          # Windows CUDA binaries (sm86, sm89)
+          - name: windows-x86_64-cuda-sm86
+            os: windows-2022
+            backend: cuda
+            cuda_arch: "86"
+
+          - name: windows-x86_64-cuda-sm89
+            os: windows-2022
+            backend: cuda
+            cuda_arch: "89"
+
+          # Linux CUDA binaries (sm80, sm86, sm89)
+          - name: linux-x86_64-cuda-sm80
+            os: ubuntu-22.04
+            backend: cuda
+            cuda_arch: "80"
+
+          - name: linux-x86_64-cuda-sm86
+            os: ubuntu-22.04
+            backend: cuda
+            cuda_arch: "86"
+
+          - name: linux-x86_64-cuda-sm89
+            os: ubuntu-22.04
+            backend: cuda
+            cuda_arch: "89"
+
+          # Vulkan (no GPU required to compile; shaders are built with glslc)
+          - name: linux-x86_64-vulkan
+            os: ubuntu-22.04
+            backend: vulkan
+
+          - name: windows-x86_64-vulkan
+            os: windows-2022
+            backend: vulkan
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Ninja
+        uses: ashutoshvarma/setup-ninja@master
+
+      # Windows setup
+      - name: Set up MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Set up CUDA Toolkit (Windows)
+        if: runner.os == 'Windows' && matrix.backend == 'cuda'
+        uses: Jimver/cuda-toolkit@v0.2.21
+        with:
+          cuda: '12.4.1'
+          method: 'network'
+
+      - name: Set up CUDA flags for MSVC (Windows)
+        if: runner.os == 'Windows' && matrix.backend == 'cuda'
+        run: |
+          echo "NVCC_PREPEND_FLAGS=-allow-unsupported-compiler -Xcompiler -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH" >> $env:GITHUB_ENV
+
+      # Linux setup
+      - name: Set up CUDA Toolkit (Linux)
+        if: runner.os == 'Linux' && matrix.backend == 'cuda'
+        uses: Jimver/cuda-toolkit@v0.2.21
+        with:
+          cuda: '12.4.1'
+          method: 'network'
+
+      - name: Install Vulkan SDK (Linux)
+        if: runner.os == 'Linux' && matrix.backend == 'vulkan'
+        run: |
+          wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/lunarg-vulkan.gpg
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+          sudo apt-get update -y
+          sudo apt-get install -y build-essential vulkan-sdk libssl-dev
+
+      - name: Install Vulkan SDK (Windows)
+        if: runner.os == 'Windows' && matrix.backend == 'vulkan'
+        env:
+          VULKAN_VERSION: 1.4.357.0
+        run: |
+          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
+
+      # Configure CMake
+      - name: Configure CMake (macOS Metal)
+        if: matrix.backend == 'metal'
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGMLC_ENABLE_METAL=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGMLC_BUILD_EXAMPLES=ON
+
+      - name: Configure CMake (Windows CUDA)
+        if: runner.os == 'Windows' && matrix.backend == 'cuda'
+        run: |
+          cmake -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DGGMLC_ENABLE_CUDA=ON `
+            -DGGMLC_BUILD_EXAMPLES=ON `
+            -DCMAKE_CUDA_ARCHITECTURES=${{ matrix.cuda_arch }} `
+            -DCMAKE_CUDA_RUNTIME_LIBRARY=Static `
+            -DCMAKE_CUDA_FLAGS="-allow-unsupported-compiler -Xcompiler -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
+
+      - name: Configure CMake (Linux CUDA)
+        if: runner.os == 'Linux' && matrix.backend == 'cuda'
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGMLC_ENABLE_CUDA=ON \
+            -DGGMLC_BUILD_EXAMPLES=ON \
+            -DCMAKE_CUDA_ARCHITECTURES=${{ matrix.cuda_arch }} \
+            -DCMAKE_CUDA_RUNTIME_LIBRARY=Static
+
+      - name: Configure CMake (Linux Vulkan)
+        if: runner.os == 'Linux' && matrix.backend == 'vulkan'
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGMLC_ENABLE_VULKAN=ON \
+            -DGGMLC_BUILD_EXAMPLES=ON
+
+      - name: Configure CMake (Windows Vulkan)
+        if: runner.os == 'Windows' && matrix.backend == 'vulkan'
+        run: |
+          cmake -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DGGMLC_ENABLE_VULKAN=ON `
+            -DGGMLC_BUILD_EXAMPLES=ON
+
+      # Build Targets
+      - name: Build Binaries (ggmlc-run, tab_completion, timesfm, laya)
+        run: |
+          cmake --build build --config Release
+
+      # Package Artifacts
+      - name: Package Binaries (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          tar -czvf "dist/ggmlc-run-${{ matrix.name }}.tar.gz" -C build/runtime ggmlc-run
+          tar -czvf "dist/tab_completion-${{ matrix.name }}.tar.gz" -C build/examples/tab_completion tab_completion
+          tar -czvf "dist/timesfm-${{ matrix.name }}.tar.gz" -C build/examples/timesfm timesfm
+          tar -czvf "dist/timesfm_bench-${{ matrix.name }}.tar.gz" -C build/examples/timesfm timesfm_bench
+          tar -czvf "dist/laya-${{ matrix.name }}.tar.gz" -C build/examples/laya laya
+
+      - name: Package Binaries (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          New-Item -ItemType Directory -Force -Path dist
+          Compress-Archive -Path build\runtime\ggmlc-run.exe -DestinationPath "dist\ggmlc-run-${{ matrix.name }}.zip"
+          Compress-Archive -Path build\examples\tab_completion\tab_completion.exe -DestinationPath "dist\tab_completion-${{ matrix.name }}.zip"
+          Compress-Archive -Path build\examples\timesfm\timesfm.exe -DestinationPath "dist\timesfm-${{ matrix.name }}.zip"
+          Compress-Archive -Path build\examples\timesfm\timesfm_bench.exe -DestinationPath "dist\timesfm_bench-${{ matrix.name }}.zip"
+          Compress-Archive -Path build\examples\laya\laya.exe -DestinationPath "dist\laya-${{ matrix.name }}.zip"
+
+      - name: Upload Binary Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.name }}
+          path: dist/*
+
+  publish_binaries:
+    name: Publish Binaries to GitHub Release
+    needs: [check_main, build_binaries]
+    if: (needs.check_main.outputs.is_main == 'true' || github.event_name == 'workflow_dispatch') && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List Release Binaries
+        run: ls -la dist/
+
+      - name: Attach Binaries to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

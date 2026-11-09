@@ -1,0 +1,150 @@
+cmake_minimum_required(VERSION 3.10)
+project(ggmlc LANGUAGES C CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+option(GGMLC_ENABLE_CUDA "Enable CUDA backend in ggmlc" OFF)
+option(GGMLC_ENABLE_METAL "Enable Metal backend in ggmlc" OFF)
+option(GGMLC_ENABLE_VULKAN "Enable Vulkan backend in ggmlc" OFF)
+option(GGMLC_BUILD_EXAMPLES "Build downstream application examples" ON)
+option(GGMLC_BUILD_TESTS "Build native runtime tests" OFF)
+
+if (GGMLC_BUILD_TESTS)
+    enable_testing()
+endif()
+
+# Includes
+include_directories(
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/src/ggml-cpu
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime/include
+)
+
+if (APPLE OR CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    set(GGML_NATIVE OFF CACHE BOOL "Disable native in GGML on Apple Clang" FORCE)
+endif()
+
+if (GGMLC_ENABLE_CUDA)
+    enable_language(CUDA)
+    set(GGML_CUDA ON CACHE BOOL "Enable CUDA in GGML" FORCE)
+    set(GGML_CUDA_GRAPHS ON CACHE BOOL "Enable CUDA graphs in GGML (match llama.cpp default)" FORCE)
+    set(GGML_LLAMAFILE ON CACHE BOOL "Enable llamafile in GGML" FORCE)
+    set(GGML_BUILD_TESTS OFF CACHE BOOL "Disable GGML tests" FORCE)
+    set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "Disable GGML examples" FORCE)
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build static GGML libraries" FORCE)
+    if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "")
+        set(CMAKE_CUDA_ARCHITECTURES "native" CACHE STRING "CUDA architectures" FORCE)
+    endif()
+
+    include_directories(
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/src/ggml-cuda
+    )
+
+    add_subdirectory(third_party/ggml)
+    add_compile_definitions(GGML_USE_CUDA)
+elseif (GGMLC_ENABLE_METAL)
+    set(GGML_METAL ON CACHE BOOL "Enable Metal in GGML" FORCE)
+    set(GGML_NATIVE OFF CACHE BOOL "Disable native in GGML on Apple Clang" FORCE)
+    set(GGML_BUILD_TESTS OFF CACHE BOOL "Disable GGML tests" FORCE)
+    set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "Disable GGML examples" FORCE)
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build static GGML libraries" FORCE)
+
+    add_subdirectory(third_party/ggml)
+    add_compile_definitions(GGML_USE_METAL)
+elseif (GGMLC_ENABLE_VULKAN)
+    set(GGML_VULKAN ON CACHE BOOL "Enable Vulkan in GGML" FORCE)
+    set(GGML_BUILD_TESTS OFF CACHE BOOL "Disable GGML tests" FORCE)
+    set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "Disable GGML examples" FORCE)
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build static GGML libraries" FORCE)
+
+    add_subdirectory(third_party/ggml)
+    add_compile_definitions(GGML_USE_VULKAN)
+else()
+    # GGML Library source files (CPU-only build)
+    set(GGML_SOURCES
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/src/ggml.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/src/ggml-alloc.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/src/ggml-backend.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/src/ggml-backend-reg.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/src/ggml-backend-meta.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/src/ggml-quants.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/src/ggml-threading.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/src/ggml-cpu/ggml-cpu.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/src/ggml-cpu/ggml-cpu.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/src/ggml-cpu/ops.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/src/ggml-cpu/quants.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/src/ggml-cpu/traits.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/src/ggml-cpu/unary-ops.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/src/ggml-cpu/binary-ops.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/src/ggml-cpu/vec.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/src/ggml-cpu/repack.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/src/gguf.cpp
+    )
+
+    if (CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64|ARM64")
+        list(APPEND GGML_SOURCES
+            ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/src/ggml-cpu/arch/arm/quants.c
+            ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/src/ggml-cpu/arch/arm/cpu-feats.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/src/ggml-cpu/arch/arm/repack.cpp
+        )
+        include_directories(
+            ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/src/ggml-cpu/arch/arm
+        )
+    else()
+        list(APPEND GGML_SOURCES
+            ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/src/ggml-cpu/arch/x86/quants.c
+            ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/src/ggml-cpu/arch/x86/cpu-feats.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/src/ggml-cpu/arch/x86/repack.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/src/ggml-cpu/llamafile/sgemm.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/src/ggml-cpu/amx/amx.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/src/ggml-cpu/amx/mmq.cpp
+        )
+        include_directories(
+            ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/src/ggml-cpu/arch/x86
+            ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/src/ggml-cpu/llamafile
+            ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/src/ggml-cpu/amx
+        )
+    endif()
+
+    add_library(ggml_lib STATIC ${GGML_SOURCES})
+    option(GGML_NATIVE "Optimize GGML for the build machine's CPU" ON)
+    if (GGML_NATIVE AND NOT CMAKE_CROSSCOMPILING AND NOT MSVC
+        AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang"
+        AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        # Match GGML's native CPU optimization for this standalone source build.
+        if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64|i.86")
+            target_compile_options(ggml_lib PRIVATE -march=native)
+        elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64|ARM64")
+            target_compile_options(ggml_lib PRIVATE -mcpu=native)
+        endif()
+    endif()
+    target_compile_definitions(ggml_lib PUBLIC
+        _GNU_SOURCE
+        GGML_USE_CPU
+        GGML_VERSION="0.1.0"
+        GGML_COMMIT="master"
+    )
+    if (NOT CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64|ARM64")
+        target_compile_definitions(ggml_lib PUBLIC GGML_USE_LLAMAFILE)
+    endif()
+    find_package(Threads REQUIRED)
+    target_link_libraries(ggml_lib PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
+
+    if (APPLE)
+        find_library(ACCELERATE_FRAMEWORK Accelerate)
+        if (ACCELERATE_FRAMEWORK)
+            target_link_libraries(ggml_lib PUBLIC ${ACCELERATE_FRAMEWORK})
+        endif()
+    endif()
+endif()
+
+add_subdirectory(runtime)
+
+# Downstream showcase application examples
+if (GGMLC_BUILD_EXAMPLES AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/examples/CMakeLists.txt")
+    add_subdirectory(examples)
+endif()

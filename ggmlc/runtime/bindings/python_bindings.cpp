@@ -1,0 +1,295 @@
+#include <nanobind/nanobind.h>
+#include <nanobind/ndarray.h>
+#include <nanobind/stl/string.h>
+#include <nanobind/stl/vector.h>
+#include <nanobind/stl/unordered_map.h>
+#include <nanobind/stl/shared_ptr.h>
+#include <nanobind/stl/pair.h>
+#include <nanobind/stl/array.h>
+
+#include "ggmlc/loader.h"
+#include "ggmlc/executor.h"
+#include "ggmlc/vmm_pool.h"
+#include "ggmlc/batch_scheduler.h"
+#include "gguf.h"
+
+namespace nb = nanobind;
+using namespace nb::literals;
+
+#include "ggmlc/pipeline/image.h"
+#include "ggmlc/pipeline/tokenizer.h"
+
+NB_MODULE(_runtime, m) {
+    m.doc() = "Native C++ execution runtime and preprocessing for ggmlc models (nanobind)";
+
+    // ImagePreprocessor
+    nb::class_<ggmlc::pipeline::ImageTensor>(m, "ImageTensor")
+        .def_ro("channels", &ggmlc::pipeline::ImageTensor::channels)
+        .def_ro("height", &ggmlc::pipeline::ImageTensor::height)
+        .def_ro("width", &ggmlc::pipeline::ImageTensor::width)
+        .def_ro("data", &ggmlc::pipeline::ImageTensor::data);
+
+    nb::class_<ggmlc::pipeline::ImagePreprocessor>(m, "NativeImagePreprocessor")
+        .def_static("preprocess_file", &ggmlc::pipeline::ImagePreprocessor::preprocess_file,
+                    "filepath"_a, "target_width"_a = 224, "target_height"_a = 224,
+                    "mean"_a = std::vector<float>{0.48145466f, 0.4578275f, 0.40821073f},
+                    "std"_a = std::vector<float>{0.26862954f, 0.26130258f, 0.27577711f},
+                    "do_center_crop"_a = true)
+        .def_static("preprocess_memory", [](nb::bytes bytes_obj, int target_w, int target_h,
+                                            const std::vector<float>& mean, const std::vector<float>& std,
+                                            bool do_center_crop) {
+            const uint8_t* ptr = reinterpret_cast<const uint8_t*>(bytes_obj.c_str());
+            return ggmlc::pipeline::ImagePreprocessor::preprocess_memory(ptr, bytes_obj.size(), target_w, target_h, mean, std, do_center_crop);
+        }, "data"_a, "target_width"_a = 224, "target_height"_a = 224,
+           "mean"_a = std::vector<float>{0.48145466f, 0.4578275f, 0.40821073f},
+           "std"_a = std::vector<float>{0.26862954f, 0.26130258f, 0.27577711f},
+           "do_center_crop"_a = true);
+
+    // BPETokenizer
+    nb::class_<ggmlc::pipeline::BPETokenizer>(m, "NativeBPETokenizer")
+        .def(nb::init<>())
+        .def("init", &ggmlc::pipeline::BPETokenizer::init,
+             "tokens"_a, "merges"_a, "bos_id"_a = 49406, "eos_id"_a = 49407, "pad_id"_a = 49407, "unk_id"_a = 0,
+             "pre_tokenizer"_a = "clip", "chat_template"_a = "")
+        .def("init_from_gguf_file", &ggmlc::pipeline::BPETokenizer::init_from_gguf_file, "filepath"_a)
+        .def("encode", &ggmlc::pipeline::BPETokenizer::encode,
+             "text"_a, "max_length"_a = 0, "add_special_tokens"_a = true, "pad_to_max"_a = false)
+        .def("decode", &ggmlc::pipeline::BPETokenizer::decode,
+             "ids"_a, "skip_special_tokens"_a = true)
+        .def("decode_token", &ggmlc::pipeline::BPETokenizer::decode_token,
+             "id"_a, "skip_special_tokens"_a = true)
+        .def("apply_chat_template", &ggmlc::pipeline::BPETokenizer::apply_chat_template,
+             "user_msg"_a, "system_msg"_a = "", "add_generation_prompt"_a = true)
+        .def_prop_ro("bos_token_id", &ggmlc::pipeline::BPETokenizer::bos_token_id)
+        .def_prop_ro("eos_token_id", &ggmlc::pipeline::BPETokenizer::eos_token_id)
+        .def_prop_ro("pad_token_id", &ggmlc::pipeline::BPETokenizer::pad_token_id)
+        .def_prop_ro("unk_token_id", &ggmlc::pipeline::BPETokenizer::unk_token_id)
+        .def_prop_ro("pre_tokenizer", &ggmlc::pipeline::BPETokenizer::pre_tokenizer)
+        .def_prop_ro("chat_template", &ggmlc::pipeline::BPETokenizer::chat_template)
+        .def_prop_ro("vocab_size", &ggmlc::pipeline::BPETokenizer::vocab_size);
+
+    // SerializedTensor
+    nb::class_<ggmlc::SerializedTensor>(m, "SerializedTensor")
+        .def_ro("id", &ggmlc::SerializedTensor::id)
+        .def_ro("name", &ggmlc::SerializedTensor::name)
+        .def_ro("data_size", &ggmlc::SerializedTensor::data_size)
+        .def_prop_ro("storage", [](const ggmlc::SerializedTensor& t) {
+            return static_cast<int32_t>(t.storage);
+        })
+        .def_prop_ro("type", [](const ggmlc::SerializedTensor& t) {
+            return static_cast<int32_t>(t.type);
+        })
+        .def("symbol_index", [](const ggmlc::SerializedTensor& t, int axis) -> int64_t {
+            if (axis < 0 || axis > 3 || !t.ne[axis] || t.ne[axis]->type != ggmlc::DimType::SYMBOL) {
+                return -1;
+            }
+            return t.ne[axis]->val;
+        }, "axis"_a);
+
+    nb::class_<ggmlc::SerializedOp>(m, "SerializedOp")
+        .def_ro("id", &ggmlc::SerializedOp::id)
+        .def_ro("opcode", &ggmlc::SerializedOp::opcode)
+        .def_ro("name", &ggmlc::SerializedOp::name)
+        .def_ro("inputs", &ggmlc::SerializedOp::inputs)
+        .def_ro("outputs", &ggmlc::SerializedOp::outputs);
+
+    // SerializedModelGraph
+    nb::class_<ggmlc::SerializedModelGraph>(m, "SerializedModelGraph")
+        .def_ro("name", &ggmlc::SerializedModelGraph::name)
+        .def_ro("symbol_table", &ggmlc::SerializedModelGraph::symbol_table)
+        .def_ro("inputs", &ggmlc::SerializedModelGraph::inputs)
+        .def_ro("outputs", &ggmlc::SerializedModelGraph::outputs)
+        .def_ro("parameters", &ggmlc::SerializedModelGraph::parameters)
+        .def_ro("tensors", &ggmlc::SerializedModelGraph::tensors)
+        .def_ro("ops", &ggmlc::SerializedModelGraph::ops);
+
+    // ModelLoader
+    nb::class_<ggmlc::ModelLoader>(m, "ModelLoader")
+        .def_static("load_from_file", &ggmlc::ModelLoader::load_from_file, "filepath"_a)
+        .def_static("load_from_bytes", [](nb::bytes bytes_obj) {
+            const uint8_t* ptr = reinterpret_cast<const uint8_t*>(bytes_obj.c_str());
+            size_t size = bytes_obj.size();
+            auto graph = ggmlc::ModelLoader::load_from_memory(ptr, size);
+            graph.data_buffer.assign(ptr, ptr + size);
+
+            // Re-bind data_ptr relative to graph.data_buffer
+            struct gguf_init_params params = { true, nullptr };
+            struct gguf_context* ctx = gguf_init_from_buffer(graph.data_buffer.data(), graph.data_buffer.size(), params);
+            if (ctx) {
+                size_t data_offset = gguf_get_data_offset(ctx);
+                const uint8_t* base_data = graph.data_buffer.data() + data_offset;
+                for (auto& pair : graph.tensors) {
+                    int64_t t_id = gguf_find_tensor(ctx, pair.second.name.c_str());
+                    if (t_id >= 0) {
+                        pair.second.data_ptr = base_data + gguf_get_tensor_offset(ctx, t_id);
+                    }
+                }
+                gguf_free(ctx);
+            }
+            return graph;
+        }, "data"_a);
+
+    // Query available devices
+    m.def("get_available_devices", &ggmlc::ModelExecutor::get_available_devices, "Query available execution devices");
+
+    // ModelExecutor
+    nb::class_<ggmlc::ModelExecutor>(m, "ModelExecutor")
+        .def(nb::init<const ggmlc::SerializedModelGraph&, const std::string&>(), "graph"_a, "device"_a = "cpu")
+        .def_prop_ro("device", &ggmlc::ModelExecutor::device)
+        .def("prepare", [](ggmlc::ModelExecutor& self,
+                           const std::unordered_map<std::string, int64_t>& symbols,
+                           bool enable_arena_reuse) {
+            self.prepare(symbols, enable_arena_reuse);
+        }, "symbols"_a = std::unordered_map<std::string, int64_t>{}, "enable_arena_reuse"_a = true)
+        .def("set_input_by_id", [](ggmlc::ModelExecutor& self, uint32_t tensor_id, nb::ndarray<nb::ro, nb::c_contig, nb::device::cpu> array) {
+            self.set_input(tensor_id, array.data(), array.size() * array.itemsize());
+        }, "tensor_id"_a, "array"_a)
+        .def("set_input_by_name", [](ggmlc::ModelExecutor& self, const std::string& name, nb::ndarray<nb::ro, nb::c_contig, nb::device::cpu> array) {
+            self.set_input_by_name(name, array.data(), array.size() * array.itemsize());
+        }, "name"_a, "array"_a)
+        .def("set_state_by_id", [](ggmlc::ModelExecutor& self, uint32_t tensor_id, nb::ndarray<nb::ro, nb::c_contig, nb::device::cpu> array) {
+            self.set_state(tensor_id, array.data(), array.size() * array.itemsize());
+        }, "tensor_id"_a, "array"_a)
+        .def("set_state_by_name", [](ggmlc::ModelExecutor& self, const std::string& name, nb::ndarray<nb::ro, nb::c_contig, nb::device::cpu> array) {
+            self.set_state_by_name(name, array.data(), array.size() * array.itemsize());
+        }, "name"_a, "array"_a)
+        .def("run", [](ggmlc::ModelExecutor& self, int n_threads) {
+            nb::gil_scoped_release release;
+            self.run(n_threads);
+        }, "n_threads"_a = 1)
+        .def("synchronize", [](ggmlc::ModelExecutor& self) {
+            nb::gil_scoped_release release;
+            self.synchronize();
+        })
+        .def("get_output_bytes", [](ggmlc::ModelExecutor& self, uint32_t tensor_id) -> nb::bytes {
+            const void* ptr = self.get_output_data(tensor_id);
+            size_t size_bytes = self.get_tensor_size_bytes(tensor_id);
+            if (!ptr || size_bytes == 0) {
+                return nb::bytes("", 0);
+            }
+            return nb::bytes(reinterpret_cast<const char*>(ptr), size_bytes);
+        }, "tensor_id"_a)
+        .def("get_state_bytes", [](ggmlc::ModelExecutor& self, uint32_t tensor_id) -> nb::bytes {
+            const void* ptr = self.get_state_data(tensor_id);
+            size_t size_bytes = self.get_tensor_size_bytes(tensor_id);
+            if (!ptr || size_bytes == 0) {
+                return nb::bytes("", 0);
+            }
+            return nb::bytes(reinterpret_cast<const char*>(ptr), size_bytes);
+        }, "tensor_id"_a)
+        .def("get_state_bytes_by_name", [](ggmlc::ModelExecutor& self, const std::string& name) -> nb::bytes {
+            const void* ptr = self.get_state_data_by_name(name);
+            if (!ptr) {
+                return nb::bytes("", 0);
+            }
+            return nb::bytes(reinterpret_cast<const char*>(ptr), 0);
+        }, "name"_a)
+        .def("get_tensor_shape", [](const ggmlc::ModelExecutor& self, uint32_t tensor_id) -> std::vector<int64_t> {
+            auto s = self.get_tensor_shape(tensor_id);
+            return std::vector<int64_t>(s.begin(), s.end());
+        }, "tensor_id"_a)
+        .def("get_tensor_size_bytes", &ggmlc::ModelExecutor::get_tensor_size_bytes, "tensor_id"_a)
+        .def("reset_state", &ggmlc::ModelExecutor::reset_state)
+        .def("init_kv_cache", &ggmlc::ModelExecutor::init_kv_cache, "max_ctx"_a = 2048)
+        .def("reset_kv_cache", &ggmlc::ModelExecutor::reset_kv_cache)
+        .def("has_kv_cache", &ggmlc::ModelExecutor::has_kv_cache)
+        .def("init_paged_kv_cache", &ggmlc::ModelExecutor::init_paged_kv_cache, "max_batch"_a = 8, "max_ctx"_a = 2048)
+        .def("is_paged_kv_cache_enabled", &ggmlc::ModelExecutor::is_paged_kv_cache_enabled)
+        .def("paged_kv_alloc_slot", &ggmlc::ModelExecutor::paged_kv_alloc_slot, "slot_id"_a, "prefix_hash"_a = "")
+        .def("paged_kv_free_slot", &ggmlc::ModelExecutor::paged_kv_free_slot, "slot_id"_a)
+        .def("paged_kv_ensure_tokens", &ggmlc::ModelExecutor::paged_kv_ensure_tokens, "slot_id"_a, "total_tokens"_a)
+        .def("get_paged_active_vram_bytes", &ggmlc::ModelExecutor::get_paged_active_vram_bytes)
+        .def("configure_vmm_pool", &ggmlc::ModelExecutor::configure_vmm_pool, "max_warm_pages"_a = 64, "prealloc_pages"_a = 0)
+        .def_prop_ro("tokens_per_page", &ggmlc::ModelExecutor::get_tokens_per_page)
+        .def("set_tokens_per_page", &ggmlc::ModelExecutor::set_tokens_per_page, "tokens_per_page"_a)
+        .def("set_enable_cuda_graph", &ggmlc::ModelExecutor::set_enable_cuda_graph, "enable"_a)
+        .def("is_cuda_graph_enabled", &ggmlc::ModelExecutor::is_cuda_graph_enabled)
+        .def("is_cuda_graph_captured", &ggmlc::ModelExecutor::is_cuda_graph_captured)
+        .def("set_enable_cuda_graph_buckets", &ggmlc::ModelExecutor::set_enable_cuda_graph_buckets, "enable"_a)
+        .def("is_cuda_graph_buckets_enabled", &ggmlc::ModelExecutor::is_cuda_graph_buckets_enabled)
+        .def("is_cuda_graph_bucket_captured", &ggmlc::ModelExecutor::is_cuda_graph_bucket_captured, "batch_size"_a)
+        .def("set_enable_profile", &ggmlc::ModelExecutor::set_enable_profile, "enable"_a)
+        .def("reset_profile", &ggmlc::ModelExecutor::reset_profile)
+        .def("set_logits_last_only", &ggmlc::ModelExecutor::set_logits_last_only, "enable"_a)
+        .def("logits_last_only", &ggmlc::ModelExecutor::logits_last_only)
+        .def("runtime_graph_summary", &ggmlc::ModelExecutor::runtime_graph_summary)
+        .def("runtime_mul_mat_shape_summary", &ggmlc::ModelExecutor::runtime_mul_mat_shape_summary)
+        .def_static("ggml_cuda_graphs_compiled", &ggmlc::ModelExecutor::ggml_cuda_graphs_compiled);
+
+    // VMMBlockManager
+    nb::class_<ggmlc::VMMBlockManager>(m, "NativeVMMBlockManager")
+        .def(nb::init<>())
+        .def_static("is_supported_on_device", &ggmlc::VMMBlockManager::is_supported_on_device, "device_id"_a = 0)
+        .def("init", &ggmlc::VMMBlockManager::init, "device_id"_a = 0)
+        .def("is_initialized", &ggmlc::VMMBlockManager::is_initialized)
+        .def_prop_ro("page_size", &ggmlc::VMMBlockManager::page_size)
+        .def("reserve_virtual_window", &ggmlc::VMMBlockManager::reserve_virtual_window, "window_bytes"_a)
+        .def("free_virtual_window", &ggmlc::VMMBlockManager::free_virtual_window, "va_ptr"_a, "window_bytes"_a)
+        .def("alloc_physical_page", &ggmlc::VMMBlockManager::alloc_physical_page)
+        .def("retain_physical_page", &ggmlc::VMMBlockManager::retain_physical_page, "page_handle"_a)
+        .def("release_physical_page", &ggmlc::VMMBlockManager::release_physical_page, "page_handle"_a)
+        .def("map_page", &ggmlc::VMMBlockManager::map_page, "va_offset"_a, "page_handle"_a)
+        .def("unmap_page", &ggmlc::VMMBlockManager::unmap_page, "va_offset"_a)
+        .def("get_prefix_page", &ggmlc::VMMBlockManager::get_prefix_page, "prefix_hash"_a)
+        .def("register_prefix_page", &ggmlc::VMMBlockManager::register_prefix_page, "prefix_hash"_a, "page_handle"_a)
+        .def("evict_prefix_page", &ggmlc::VMMBlockManager::evict_prefix_page, "prefix_hash"_a)
+        .def_prop_ro("prefix_cache_size", &ggmlc::VMMBlockManager::prefix_cache_size)
+        .def("configure_pool", &ggmlc::VMMBlockManager::configure_pool, "max_warm_pages"_a = 64, "prealloc_pages"_a = 0)
+        .def_prop_ro("warm_pool_pages", &ggmlc::VMMBlockManager::warm_pool_pages)
+        .def_prop_ro("free_pool_pages", &ggmlc::VMMBlockManager::free_pool_pages)
+        .def_prop_ro("max_warm_pages", &ggmlc::VMMBlockManager::max_warm_pages)
+        .def("drain_warm_pool", &ggmlc::VMMBlockManager::drain_warm_pool)
+        .def_prop_ro("total_reserved_va_bytes", &ggmlc::VMMBlockManager::total_reserved_va_bytes)
+        .def_prop_ro("total_mapped_physical_bytes", &ggmlc::VMMBlockManager::total_mapped_physical_bytes)
+        .def_prop_ro("total_allocated_pages", &ggmlc::VMMBlockManager::total_allocated_pages)
+        .def("reset", &ggmlc::VMMBlockManager::reset);
+
+    // Paged Radix Tree
+    nb::class_<ggmlc::PrefixMatchResult>(m, "PrefixMatchResult")
+        .def_ro("matched_tokens", &ggmlc::PrefixMatchResult::matched_tokens)
+        .def_ro("matched_pages", &ggmlc::PrefixMatchResult::matched_pages);
+
+    nb::class_<ggmlc::PagedRadixTree>(m, "PagedRadixTree")
+        .def(nb::init<size_t>(), "tokens_per_page"_a = 1024)
+        .def("match_prefix", &ggmlc::PagedRadixTree::match_prefix, "prompt_tokens"_a)
+        .def_prop_ro("tokens_per_page", &ggmlc::PagedRadixTree::tokens_per_page)
+        .def_prop_ro("total_cached_pages", &ggmlc::PagedRadixTree::total_cached_pages)
+        .def_prop_ro("total_nodes", &ggmlc::PagedRadixTree::total_nodes)
+        .def("reset", &ggmlc::PagedRadixTree::reset);
+
+    // Continuous Batching Scheduler
+    nb::class_<ggmlc::GenerationRequest>(m, "GenerationRequest")
+        .def_ro("request_id", &ggmlc::GenerationRequest::request_id)
+        .def_ro("prompt_tokens", &ggmlc::GenerationRequest::prompt_tokens)
+        .def_ro("generated_tokens", &ggmlc::GenerationRequest::generated_tokens)
+        .def_ro("slot_id", &ggmlc::GenerationRequest::slot_id)
+        .def_ro("current_pos", &ggmlc::GenerationRequest::current_pos)
+        .def_ro("max_new_tokens", &ggmlc::GenerationRequest::max_new_tokens)
+        .def_ro("temperature", &ggmlc::GenerationRequest::temperature)
+        .def_ro("eos_token_id", &ggmlc::GenerationRequest::eos_token_id)
+        .def_ro("finished", &ggmlc::GenerationRequest::finished)
+        .def_ro("finish_reason", &ggmlc::GenerationRequest::finish_reason)
+        .def_ro("prefix_tokens_matched", &ggmlc::GenerationRequest::prefix_tokens_matched);
+
+    nb::class_<ggmlc::StepResult>(m, "StepResult")
+        .def_ro("new_tokens", &ggmlc::StepResult::new_tokens)
+        .def_ro("completed_request_ids", &ggmlc::StepResult::completed_request_ids);
+
+    nb::class_<ggmlc::ContinuousBatchScheduler>(m, "ContinuousBatchScheduler")
+        .def(nb::init<ggmlc::ModelExecutor&, size_t, int>(), "executor"_a, "max_batch_size"_a = 8, "eos_token_id"_a = 0)
+        .def("add_request", &ggmlc::ContinuousBatchScheduler::add_request,
+             "prompt_tokens"_a, "max_new_tokens"_a = 32, "temperature"_a = 0.0f, "eos_token_id"_a = -1)
+        .def("step", [](ggmlc::ContinuousBatchScheduler& self) {
+            nb::gil_scoped_release release;
+            return self.step();
+        })
+        .def("has_work", &ggmlc::ContinuousBatchScheduler::has_work)
+        .def("active_count", &ggmlc::ContinuousBatchScheduler::active_count)
+        .def("pending_count", &ggmlc::ContinuousBatchScheduler::pending_count)
+        .def("max_batch_size", &ggmlc::ContinuousBatchScheduler::max_batch_size)
+        .def("get_request", &ggmlc::ContinuousBatchScheduler::get_request, "request_id"_a)
+        .def("enable_prefix_caching", &ggmlc::ContinuousBatchScheduler::enable_prefix_caching, "enable"_a)
+        .def("is_prefix_caching_enabled", &ggmlc::ContinuousBatchScheduler::is_prefix_caching_enabled)
+        .def_prop_ro("total_prefix_cache_hits", &ggmlc::ContinuousBatchScheduler::total_prefix_cache_hits)
+        .def_prop_ro("total_prefix_tokens_saved", &ggmlc::ContinuousBatchScheduler::total_prefix_tokens_saved);
+}

@@ -1,0 +1,135 @@
+if (GGMLC_ENABLE_CUDA)
+    set(GGML_BACKEND_LIBS ggml ggml-base ggml-cpu ggml-cuda cuda)
+    add_compile_definitions(GGML_USE_CUDA)
+    set(CUDA_GRAPH_SOURCES src/cuda_graph.cu src/vmm_pool.cu)
+elseif (GGMLC_ENABLE_METAL)
+    find_library(FOUNDATION_FRAMEWORK Foundation REQUIRED)
+    find_library(METAL_FRAMEWORK Metal REQUIRED)
+    find_library(METALKIT_FRAMEWORK MetalKit REQUIRED)
+    set(GGML_BACKEND_LIBS ggml ggml-base ggml-cpu ggml-metal ${FOUNDATION_FRAMEWORK} ${METAL_FRAMEWORK} ${METALKIT_FRAMEWORK})
+    add_compile_definitions(GGML_USE_METAL)
+    set(CUDA_GRAPH_SOURCES src/cuda_graph_stub.cpp src/vmm_pool_stub.cpp)
+elseif (GGMLC_ENABLE_VULKAN)
+    find_package(Vulkan REQUIRED)
+    set(GGML_BACKEND_LIBS ggml ggml-base ggml-cpu ggml-vulkan Vulkan::Vulkan)
+    add_compile_definitions(GGML_USE_VULKAN)
+    set(CUDA_GRAPH_SOURCES src/cuda_graph_stub.cpp src/vmm_pool_stub.cpp)
+else()
+    set(GGML_BACKEND_LIBS ggml_lib)
+    set(CUDA_GRAPH_SOURCES src/cuda_graph_stub.cpp src/vmm_pool_stub.cpp)
+endif()
+
+add_library(ggmlc_runtime STATIC
+    src/loader.cpp
+    src/executor.cpp
+    src/radix_tree.cpp
+    src/batch_scheduler.cpp
+    src/stdlib_kernels.cpp
+    src/pipeline/image.cpp
+    src/pipeline/tokenizer.cpp
+    ${CUDA_GRAPH_SOURCES}
+)
+
+target_link_libraries(ggmlc_runtime PUBLIC
+    ${GGML_BACKEND_LIBS}
+)
+
+# CLI Tool
+add_executable(ggmlc-run
+    tools/ggmlc_run.cpp
+)
+
+target_link_libraries(ggmlc-run PRIVATE
+    ggmlc_runtime
+)
+
+# Benchmark Tools
+add_executable(ggmlc-bench
+    tools/ggmlc_bench.cpp
+)
+
+target_link_libraries(ggmlc-bench PRIVATE
+    ggmlc_runtime
+)
+
+add_executable(ggml-bench
+    tools/ggmlc_bench.cpp
+)
+
+target_link_libraries(ggml-bench PRIVATE
+    ggmlc_runtime
+)
+
+if (GGMLC_BUILD_TESTS)
+    add_executable(test-executor-cpu ../tests/runtime/test_executor_cpu.cpp)
+    target_link_libraries(test-executor-cpu PRIVATE ggmlc_runtime)
+    add_test(NAME executor-cpu COMMAND test-executor-cpu)
+endif()
+
+# Shared library for C-FFI
+add_library(ggmlc_runtime_shared SHARED
+    src/loader.cpp
+    src/executor.cpp
+    src/radix_tree.cpp
+    src/batch_scheduler.cpp
+    src/stdlib_kernels.cpp
+    src/pipeline/image.cpp
+    src/pipeline/tokenizer.cpp
+    ${CUDA_GRAPH_SOURCES}
+)
+
+target_link_libraries(ggmlc_runtime_shared PUBLIC
+    ${GGML_BACKEND_LIBS}
+)
+
+# Optional Python Bindings with nanobind (targeting Python Limited API / abi3)
+find_package(Python 3.11 COMPONENTS Interpreter Development.Module)
+message(STATUS "ggmlc CMake: Python_FOUND = ${Python_FOUND}, Python_EXECUTABLE = ${Python_EXECUTABLE}")
+if (Python_FOUND)
+    execute_process(
+        COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir
+        OUTPUT_VARIABLE NANOBIND_CMAKE_DIR
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+    message(STATUS "ggmlc CMake: NANOBIND_CMAKE_DIR = ${NANOBIND_CMAKE_DIR}")
+    if (EXISTS "${NANOBIND_CMAKE_DIR}")
+        list(APPEND CMAKE_PREFIX_PATH "${NANOBIND_CMAKE_DIR}")
+    endif()
+
+    find_package(nanobind CONFIG)
+    message(STATUS "ggmlc CMake: nanobind_FOUND = ${nanobind_FOUND}")
+    if (nanobind_FOUND)
+        message(STATUS "ggmlc CMake: entering nanobind_add_module block!")
+        nanobind_add_module(_runtime
+            bindings/python_bindings.cpp
+            src/loader.cpp
+            src/executor.cpp
+            src/radix_tree.cpp
+            src/batch_scheduler.cpp
+            src/stdlib_kernels.cpp
+            src/pipeline/image.cpp
+            src/pipeline/tokenizer.cpp
+            ${CUDA_GRAPH_SOURCES}
+        )
+        target_link_libraries(_runtime PRIVATE ${GGML_BACKEND_LIBS})
+        if (GGMLC_ENABLE_CUDA)
+            target_compile_definitions(_runtime PRIVATE GGML_USE_CUDA)
+        elseif (GGMLC_ENABLE_METAL)
+            target_compile_definitions(_runtime PRIVATE GGML_USE_METAL)
+        elseif (GGMLC_ENABLE_VULKAN)
+            target_compile_definitions(_runtime PRIVATE GGML_USE_VULKAN)
+        endif()
+        
+        # Set output directory to python/ggmlc for direct import
+        set_target_properties(_runtime PROPERTIES
+            LIBRARY_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/python/ggmlc"
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/python/ggmlc"
+            LIBRARY_OUTPUT_DIRECTORY_RELEASE "${CMAKE_SOURCE_DIR}/python/ggmlc"
+            RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_SOURCE_DIR}/python/ggmlc"
+            LIBRARY_OUTPUT_DIRECTORY_DEBUG "${CMAKE_SOURCE_DIR}/python/ggmlc"
+            RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_SOURCE_DIR}/python/ggmlc"
+        )
+
+        install(TARGETS _runtime DESTINATION ggmlc)
+    endif()
+endif()

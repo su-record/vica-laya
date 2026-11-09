@@ -1,0 +1,837 @@
+"""Real checkpoint loaders for vision, language, and embedding architectures."""
+
+import torch
+from torch import nn
+
+
+def load_resnet_model(
+    variant: str = "resnet18",
+    resolution: int = 224,
+) -> tuple[nn.Module, tuple[torch.Tensor, ...], list[str]]:
+    """Loads real torchvision pretrained ResNet checkpoint."""
+    from torchvision import models
+
+    variant = variant.lower()
+    if variant == "resnet50":
+        model = models.resnet50(weights=models.ResNet50_Weights.DEFAULT).eval()
+    else:
+        model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT).eval()
+
+    example_input = (torch.randn(1, 3, resolution, resolution, dtype=torch.float32),)
+    input_names = ["x"]
+    return model, example_input, input_names
+
+
+def load_minilm_model(seq_len: int = 16) -> tuple[nn.Module, tuple[torch.Tensor, ...], list[str]]:
+    """Loads real sentence-transformers all-MiniLM-L6-v2 checkpoint."""
+    from transformers import AutoModel
+
+    model = AutoModel.from_pretrained("sentence-transformers/all-MiniLM-L6-v2").eval()
+    input_ids = torch.randint(0, 1000, (1, seq_len), dtype=torch.int32)
+    example_input = (input_ids,)
+    input_names = ["input_ids"]
+
+    # Wrap to output only dense sequence output
+    class MiniLMWrapper(nn.Module):
+        def __init__(self, base_model):
+            super().__init__()
+            self.base_model = base_model
+
+        def forward(self, input_ids):
+            out = self.base_model(input_ids=input_ids)
+            return out.last_hidden_state
+
+    return MiniLMWrapper(model), example_input, input_names
+
+
+def load_gpt2_model(
+    variant: str = "openai-community/gpt2",
+    seq_len: int = 8,
+) -> tuple[nn.Module, tuple[torch.Tensor, ...], list[str]]:
+    """Loads real Hugging Face GPT-2 checkpoint (e.g. gpt2, gpt2-medium)."""
+    from transformers import GPT2LMHeadModel
+
+    model = GPT2LMHeadModel.from_pretrained(variant).eval()
+    base_ids = [542, 67, 876, 414, 26, 335, 620, 924]
+    if seq_len <= len(base_ids):
+        input_ids = torch.tensor([base_ids[:seq_len]], dtype=torch.int32)
+    else:
+        # Repeat or generate tokens
+        repeated = (base_ids * ((seq_len // len(base_ids)) + 1))[:seq_len]
+        input_ids = torch.tensor([repeated], dtype=torch.int32)
+    pos_ids = torch.arange(0, input_ids.shape[-1], dtype=torch.int32).unsqueeze(0)
+    example_input = (input_ids, pos_ids)
+    input_names = ["input_ids", "position_ids"]
+
+    class GPT2Wrapper(nn.Module):
+        def __init__(self, base):
+            super().__init__()
+            self.wte = base.transformer.wte
+            self.wpe = base.transformer.wpe
+            self.ln_f = base.transformer.ln_f
+            self.lm_head = base.lm_head
+            self.hidden_size = base.config.n_embd
+            self.num_heads = base.config.n_head
+            self.head_dim = self.hidden_size // self.num_heads
+            self.layers = nn.ModuleList()
+
+            hidden = self.hidden_size
+            mlp_dim = 4 * hidden
+            for h in base.transformer.h:
+                w_qkv = h.attn.c_attn.weight  # [hidden, 3 * hidden]
+                b_qkv = h.attn.c_attn.bias  # [3 * hidden]
+
+                q_proj = nn.Linear(hidden, hidden)
+                k_proj = nn.Linear(hidden, hidden)
+                v_proj = nn.Linear(hidden, hidden)
+
+                q_proj.weight.data = w_qkv[:, :hidden].t().contiguous()
+                q_proj.bias.data = b_qkv[:hidden].contiguous()
+
+                k_proj.weight.data = w_qkv[:, hidden : 2 * hidden].t().contiguous()
+                k_proj.bias.data = b_qkv[hidden : 2 * hidden].contiguous()
+
+                v_proj.weight.data = w_qkv[:, 2 * hidden :].t().contiguous()
+                v_proj.bias.data = b_qkv[2 * hidden :].contiguous()
+
+                out_proj = nn.Linear(hidden, hidden)
+                out_proj.weight.data = h.attn.c_proj.weight.t().contiguous()
+                out_proj.bias.data = h.attn.c_proj.bias.contiguous()
+
+                mlp_fc = nn.Linear(hidden, mlp_dim)
+                mlp_fc.weight.data = h.mlp.c_fc.weight.t().contiguous()
+                mlp_fc.bias.data = h.mlp.c_fc.bias.contiguous()
+
+                mlp_proj = nn.Linear(mlp_dim, hidden)
+                mlp_proj.weight.data = h.mlp.c_proj.weight.t().contiguous()
+                mlp_proj.bias.data = h.mlp.c_proj.bias.contiguous()
+
+                layer = nn.ModuleDict(
+                    {
+                        "ln_1": h.ln_1,
+                        "q_proj": q_proj,
+                        "k_proj": k_proj,
+                        "v_proj": v_proj,
+                        "out_proj": out_proj,
+                        "ln_2": h.ln_2,
+                        "mlp_fc": mlp_fc,
+                        "mlp_proj": mlp_proj,
+                    }
+                )
+                self.layers.append(layer)
+
+        def forward(self, input_ids, position_ids=None):
+            bsz, seq_len = input_ids.shape
+            if position_ids is None:
+                position_ids = torch.arange(
+                    0, seq_len, dtype=torch.int32, device=input_ids.device
+                ).unsqueeze(0)
+            h = self.wte(input_ids) + self.wpe(position_ids)
+
+            for layer in self.layers:
+                residual = h
+                h_norm = layer["ln_1"](h)
+
+                q = (
+                    layer["q_proj"](h_norm)
+                    .view(bsz, seq_len, self.num_heads, self.head_dim)
+                    .transpose(1, 2)
+                )
+                k = (
+                    layer["k_proj"](h_norm)
+                    .view(bsz, seq_len, self.num_heads, self.head_dim)
+                    .transpose(1, 2)
+                )
+                v = (
+                    layer["v_proj"](h_norm)
+                    .view(bsz, seq_len, self.num_heads, self.head_dim)
+                    .transpose(1, 2)
+                )
+
+                attn_out = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
+                attn_out = attn_out.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
+                attn_out = layer["out_proj"](attn_out)
+                h = residual + attn_out
+
+                residual = h
+                h_norm = layer["ln_2"](h)
+                mlp_act = torch.nn.functional.gelu(layer["mlp_fc"](h_norm), approximate="tanh")
+                mlp_out = layer["mlp_proj"](mlp_act)
+                h = residual + mlp_out
+
+            h = self.ln_f(h)
+            return self.lm_head(h)
+
+    wrapped = GPT2Wrapper(model)
+    import gc
+
+    del model
+    gc.collect()
+    return wrapped, example_input, input_names
+
+
+def load_gpt2_medium_model(
+    seq_len: int = 8,
+) -> tuple[nn.Module, tuple[torch.Tensor, ...], list[str]]:
+    """Loads GPT-2 Medium (355M) checkpoint."""
+    return load_gpt2_model(variant="openai-community/gpt2-medium", seq_len=seq_len)
+
+
+def load_qwen_model(
+    variant: str = "Qwen/Qwen2.5-0.5B",
+    seq_len: int = 8,
+) -> tuple[nn.Module, tuple[torch.Tensor, ...], list[str]]:
+    """Loads real Hugging Face Qwen checkpoint."""
+    from transformers import AutoModelForCausalLM
+
+    model = AutoModelForCausalLM.from_pretrained(variant, torch_dtype=torch.float32).eval()
+    input_ids = torch.randint(0, 1000, (1, seq_len), dtype=torch.int32)
+    example_input = (input_ids,)
+    input_names = ["input_ids"]
+
+    class QwenWrapper(nn.Module):
+        def __init__(self, base_model):
+            super().__init__()
+            self.embed_tokens = base_model.model.embed_tokens
+            self.layers = base_model.model.layers
+            self.norm = base_model.model.norm
+            self.lm_head = base_model.lm_head
+            self.rotary_emb = base_model.model.rotary_emb
+            self.num_heads = base_model.config.num_attention_heads
+            self.num_kv_heads = base_model.config.num_key_value_heads
+            self.head_dim = base_model.config.hidden_size // self.num_heads
+            self.kv_groups = self.num_heads // self.num_kv_heads
+
+        def forward(self, input_ids):
+            h = self.embed_tokens(input_ids)
+            bsz, seq_len, _ = h.shape
+            pos = torch.arange(0, seq_len, dtype=torch.float32, device=h.device)
+            inv_freq = self.rotary_emb.inv_freq
+            freqs = pos.unsqueeze(-1) * inv_freq.unsqueeze(0)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos().unsqueeze(0)
+            sin = emb.sin().unsqueeze(0)
+
+            # Apply RoPE helper inline
+            def rotate_half(x):
+                x1 = x[..., : x.shape[-1] // 2]
+                x2 = x[..., x.shape[-1] // 2 :]
+                return torch.cat((-x2, x1), dim=-1)
+
+            def apply_rope(x):
+                c = cos.unsqueeze(1)
+                s = sin.unsqueeze(1)
+                return (x * c) + (rotate_half(x) * s)
+
+            for layer in self.layers:
+                residual = h
+                h_norm = layer.input_layernorm(h)
+
+                q = (
+                    layer.self_attn.q_proj(h_norm)
+                    .view(bsz, seq_len, self.num_heads, self.head_dim)
+                    .transpose(1, 2)
+                )
+                k = (
+                    layer.self_attn.k_proj(h_norm)
+                    .view(bsz, seq_len, self.num_kv_heads, self.head_dim)
+                    .transpose(1, 2)
+                )
+                v = (
+                    layer.self_attn.v_proj(h_norm)
+                    .view(bsz, seq_len, self.num_kv_heads, self.head_dim)
+                    .transpose(1, 2)
+                )
+
+                q = apply_rope(q)
+                k = apply_rope(k)
+
+                attn_out = torch.nn.functional.scaled_dot_product_attention(
+                    q, k, v, is_causal=True, enable_gqa=True
+                )
+                attn_out = attn_out.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
+                attn_out = layer.self_attn.o_proj(attn_out)
+                h = residual + attn_out
+
+                residual = h
+                h_norm = layer.post_attention_layernorm(h)
+                mlp_out = layer.mlp.down_proj(
+                    torch.nn.functional.silu(layer.mlp.gate_proj(h_norm))
+                    * layer.mlp.up_proj(h_norm)
+                )
+                h = residual + mlp_out
+
+            h = self.norm(h)
+            return self.lm_head(h)
+
+    wrapped = QwenWrapper(model)
+    import gc
+
+    del model
+    gc.collect()
+    return wrapped, example_input, input_names
+
+
+def load_qwen3_model(
+    variant: str = "Qwen/Qwen3-0.6B",
+    seq_len: int = 8,
+) -> tuple[nn.Module, tuple[torch.Tensor, ...], list[str]]:
+    """Loads real Hugging Face Qwen3 checkpoint with QK-Norm and GQA."""
+    from transformers import AutoModelForCausalLM
+
+    model = AutoModelForCausalLM.from_pretrained(variant, dtype=torch.float32).eval()
+    input_ids = torch.randint(0, 1000, (1, seq_len), dtype=torch.int32)
+    example_input = (input_ids,)
+    input_names = ["input_ids"]
+
+    class Qwen3Wrapper(nn.Module):
+        def __init__(self, base_model):
+            super().__init__()
+            self.embed_tokens = base_model.model.embed_tokens
+            self.layers = base_model.model.layers
+            self.norm = base_model.model.norm
+            self.lm_head = base_model.lm_head
+            self.num_heads = base_model.config.num_attention_heads
+            self.num_kv_heads = base_model.config.num_key_value_heads
+            self.head_dim = getattr(base_model.config, "head_dim", 128)
+            self.kv_groups = self.num_heads // self.num_kv_heads
+
+            dim = self.head_dim
+            base = 1000000.0
+            if hasattr(base_model.config, "rope_parameters") and base_model.config.rope_parameters:
+                base = base_model.config.rope_parameters.get("rope_theta", 1000000.0)
+            inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+            self.register_buffer("inv_freq", inv_freq)
+
+        def forward(self, input_ids):
+            h = self.embed_tokens(input_ids)
+            bsz, seq_len, _ = h.shape
+            pos = torch.arange(0, seq_len, dtype=torch.float32, device=h.device)
+            freqs = pos.unsqueeze(-1) * self.inv_freq.unsqueeze(0)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos().unsqueeze(0).unsqueeze(1)
+            sin = emb.sin().unsqueeze(0).unsqueeze(1)
+
+            def rotate_half(x):
+                x1 = x[..., : x.shape[-1] // 2]
+                x2 = x[..., x.shape[-1] // 2 :]
+                return torch.cat((-x2, x1), dim=-1)
+
+            def apply_rope(x):
+                return (x * cos) + (rotate_half(x) * sin)
+
+            for layer in self.layers:
+                residual = h
+                h_norm = layer.input_layernorm(h)
+
+                q = layer.self_attn.q_proj(h_norm).view(bsz, seq_len, self.num_heads, self.head_dim)
+                k = layer.self_attn.k_proj(h_norm).view(
+                    bsz, seq_len, self.num_kv_heads, self.head_dim
+                )
+                v = layer.self_attn.v_proj(h_norm).view(
+                    bsz, seq_len, self.num_kv_heads, self.head_dim
+                )
+
+                q = layer.self_attn.q_norm(q)
+                k = layer.self_attn.k_norm(k)
+
+                q = q.transpose(1, 2)
+                k = k.transpose(1, 2)
+                v = v.transpose(1, 2)
+
+                q = apply_rope(q)
+                k = apply_rope(k)
+
+                attn_out = torch.nn.functional.scaled_dot_product_attention(
+                    q, k, v, is_causal=True, enable_gqa=True
+                )
+                attn_out = attn_out.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
+                attn_out = layer.self_attn.o_proj(attn_out)
+                h = residual + attn_out
+
+                residual = h
+                h_norm = layer.post_attention_layernorm(h)
+                mlp_out = layer.mlp.down_proj(
+                    torch.nn.functional.silu(layer.mlp.gate_proj(h_norm))
+                    * layer.mlp.up_proj(h_norm)
+                )
+                h = residual + mlp_out
+
+            h = self.norm(h)
+            return self.lm_head(h)
+
+    return Qwen3Wrapper(model), example_input, input_names
+
+
+def load_smollm2_model(
+    variant: str = "HuggingFaceTB/SmolLM2-135M-Instruct",
+    seq_len: int = 8,
+) -> tuple[nn.Module, tuple[torch.Tensor, ...], list[str]]:
+    """Loads real Hugging Face SmolLM2 135M checkpoint."""
+    from transformers import AutoModelForCausalLM
+
+    model = AutoModelForCausalLM.from_pretrained(variant, dtype=torch.float32).eval()
+    input_ids = torch.randint(0, 1000, (1, seq_len), dtype=torch.int32)
+    example_input = (input_ids,)
+    input_names = ["input_ids"]
+
+    class SmolLM2Wrapper(nn.Module):
+        def __init__(self, base_model):
+            super().__init__()
+            self.embed_tokens = base_model.model.embed_tokens
+            self.layers = base_model.model.layers
+            self.norm = base_model.model.norm
+            self.lm_head = base_model.lm_head
+            self.num_heads = base_model.config.num_attention_heads
+            self.num_kv_heads = base_model.config.num_key_value_heads
+            self.head_dim = getattr(base_model.config, "head_dim", None) or (
+                base_model.config.hidden_size // self.num_heads
+            )
+            self.kv_groups = self.num_heads // self.num_kv_heads
+
+            # Rotary embedding inv_freq calculation
+            dim = self.head_dim
+            base = (
+                getattr(base_model.config, "rope_theta", None)
+                or (
+                    base_model.config.rope_parameters.get("rope_theta")
+                    if hasattr(base_model.config, "rope_parameters")
+                    and base_model.config.rope_parameters
+                    else None
+                )
+                or 100000.0
+            )
+            inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+            self.register_buffer("inv_freq", inv_freq)
+
+        def forward(self, input_ids):
+            h = self.embed_tokens(input_ids)
+            bsz, seq_len, _ = h.shape
+            pos = torch.arange(0, seq_len, dtype=torch.float32, device=h.device)
+            freqs = pos.unsqueeze(-1) * self.inv_freq.unsqueeze(0)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos().unsqueeze(0)
+            sin = emb.sin().unsqueeze(0)
+
+            def rotate_half(x):
+                x1 = x[..., : x.shape[-1] // 2]
+                x2 = x[..., x.shape[-1] // 2 :]
+                return torch.cat((-x2, x1), dim=-1)
+
+            def apply_rope(x):
+                c = cos.unsqueeze(1)
+                s = sin.unsqueeze(1)
+                return (x * c) + (rotate_half(x) * s)
+
+            for layer in self.layers:
+                residual = h
+                h_norm = layer.input_layernorm(h)
+
+                q = (
+                    layer.self_attn.q_proj(h_norm)
+                    .view(bsz, seq_len, self.num_heads, self.head_dim)
+                    .transpose(1, 2)
+                )
+                k = (
+                    layer.self_attn.k_proj(h_norm)
+                    .view(bsz, seq_len, self.num_kv_heads, self.head_dim)
+                    .transpose(1, 2)
+                )
+                v = (
+                    layer.self_attn.v_proj(h_norm)
+                    .view(bsz, seq_len, self.num_kv_heads, self.head_dim)
+                    .transpose(1, 2)
+                )
+
+                q = apply_rope(q)
+                k = apply_rope(k)
+
+                attn_out = torch.nn.functional.scaled_dot_product_attention(
+                    q, k, v, is_causal=True, enable_gqa=True
+                )
+                attn_out = attn_out.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
+                attn_proj = layer.self_attn.o_proj(attn_out)
+                h = residual + attn_proj
+
+                # MLP
+                residual = h
+                h_post = layer.post_attention_layernorm(h)
+                gate = layer.mlp.gate_proj(h_post)
+                up = layer.mlp.up_proj(h_post)
+                act = torch.nn.functional.silu(gate) * up
+                down = layer.mlp.down_proj(act)
+                h = residual + down
+
+            h = self.norm(h)
+            return self.lm_head(h)
+
+    wrapped = SmolLM2Wrapper(model)
+    import gc
+
+    del model
+    gc.collect()
+    return wrapped, example_input, input_names
+
+
+def load_smollm2_360m_model(
+    variant: str = "HuggingFaceTB/SmolLM2-360M-Instruct",
+    seq_len: int = 8,
+) -> tuple[nn.Module, tuple[torch.Tensor, ...], list[str]]:
+    """Loads SmolLM2 360M checkpoint."""
+    return load_smollm2_model(variant=variant, seq_len=seq_len)
+
+
+def load_qwen_1_5b_model(
+    variant: str = "Qwen/Qwen2.5-1.5B",
+    seq_len: int = 8,
+) -> tuple[nn.Module, tuple[torch.Tensor, ...], list[str]]:
+    """Loads Qwen2.5 1.5B checkpoint."""
+    return load_qwen_model(variant=variant, seq_len=seq_len)
+
+
+def load_llama_model(
+    variant: str = "unsloth/Llama-3.2-1B-Instruct",
+    seq_len: int = 8,
+) -> tuple[nn.Module, tuple[torch.Tensor, ...], list[str]]:
+    """Loads LLaMA-3 / LLaMA-3.2 architecture checkpoint."""
+    return load_smollm2_model(variant=variant, seq_len=seq_len)
+
+
+def load_gemma3_model(
+    variant: str = "google/gemma-3-270m-it",
+    seq_len: int = 8,
+) -> tuple[nn.Module, tuple[torch.Tensor, ...], list[str]]:
+    """Loads real Google Gemma 3 270M checkpoint."""
+    from transformers import AutoModelForCausalLM
+
+    model = AutoModelForCausalLM.from_pretrained(variant, dtype=torch.float32).eval()
+    input_ids = torch.randint(0, 1000, (1, seq_len), dtype=torch.int32)
+    example_input = (input_ids,)
+    input_names = ["input_ids"]
+
+    class Gemma3Wrapper(nn.Module):
+        def __init__(self, base_model):
+            super().__init__()
+            self.config = base_model.config
+            self.model = base_model.model
+            self.lm_head = base_model.lm_head
+            self.hidden_size = self.config.hidden_size
+            self.num_heads = self.config.num_attention_heads
+            self.num_kv_heads = self.config.num_key_value_heads
+            self.head_dim = self.config.head_dim
+            self.kv_groups = self.num_heads // self.num_kv_heads
+            self.scale = 1.0 / (self.config.query_pre_attn_scalar**0.5)
+
+            dim = self.head_dim
+            theta_sliding = self.config.rope_parameters["sliding_attention"]["rope_theta"]
+            theta_full = self.config.rope_parameters["full_attention"]["rope_theta"]
+            inv_sliding = 1.0 / (
+                theta_sliding ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim)
+            )
+            inv_full = 1.0 / (theta_full ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+            self.register_buffer("inv_sliding", inv_sliding)
+            self.register_buffer("inv_full", inv_full)
+
+        def forward(self, input_ids):
+            h = self.model.embed_tokens(input_ids)
+            bsz, seq_len, _ = h.shape
+
+            pos = torch.arange(0, seq_len, dtype=torch.float32, device=h.device)
+            freq_s = pos.unsqueeze(-1) * self.inv_sliding.unsqueeze(0)
+            emb_s = torch.cat((freq_s, freq_s), dim=-1)
+            cos_s = emb_s.cos().unsqueeze(0).unsqueeze(1)
+            sin_s = emb_s.sin().unsqueeze(0).unsqueeze(1)
+
+            freq_f = pos.unsqueeze(-1) * self.inv_full.unsqueeze(0)
+            emb_f = torch.cat((freq_f, freq_f), dim=-1)
+            cos_f = emb_f.cos().unsqueeze(0).unsqueeze(1)
+            sin_f = emb_f.sin().unsqueeze(0).unsqueeze(1)
+
+            def rotate_half(x):
+                x1 = x[..., : x.shape[-1] // 2]
+                x2 = x[..., x.shape[-1] // 2 :]
+                return torch.cat((-x2, x1), dim=-1)
+
+            for i, layer in enumerate(self.model.layers):
+                layer_type = self.config.layer_types[i]
+                cos = cos_s if layer_type == "sliding_attention" else cos_f
+                sin = sin_s if layer_type == "sliding_attention" else sin_f
+
+                residual = h
+                h_norm = layer.input_layernorm(h)
+
+                q = (
+                    layer.self_attn.q_proj(h_norm)
+                    .view(bsz, seq_len, self.num_heads, self.head_dim)
+                    .transpose(1, 2)
+                )
+                k = (
+                    layer.self_attn.k_proj(h_norm)
+                    .view(bsz, seq_len, self.num_kv_heads, self.head_dim)
+                    .transpose(1, 2)
+                )
+                v = (
+                    layer.self_attn.v_proj(h_norm)
+                    .view(bsz, seq_len, self.num_kv_heads, self.head_dim)
+                    .transpose(1, 2)
+                )
+
+                q = layer.self_attn.q_norm(q)
+                k = layer.self_attn.k_norm(k)
+
+                q = (q * cos) + (rotate_half(q) * sin)
+                k = (k * cos) + (rotate_half(k) * sin)
+
+                attn_out = torch.nn.functional.scaled_dot_product_attention(
+                    q, k, v, is_causal=True, scale=self.scale, enable_gqa=True
+                )
+                attn_out = (
+                    attn_out.transpose(1, 2)
+                    .contiguous()
+                    .view(bsz, seq_len, self.num_heads * self.head_dim)
+                )
+                attn_out = layer.self_attn.o_proj(attn_out)
+                attn_out = layer.post_attention_layernorm(attn_out)
+                h = residual + attn_out
+
+                residual = h
+                h_mlp = layer.pre_feedforward_layernorm(h)
+                mlp_gate = layer.mlp.act_fn(layer.mlp.gate_proj(h_mlp))
+                mlp_up = layer.mlp.up_proj(h_mlp)
+                mlp_out = layer.mlp.down_proj(mlp_gate * mlp_up)
+                mlp_out = layer.post_feedforward_layernorm(mlp_out)
+                h = residual + mlp_out
+
+            h = self.model.norm(h)
+            return self.lm_head(h)
+
+    return Gemma3Wrapper(model), example_input, input_names
+
+
+def load_bge_m3_distill_model(
+    seq_len: int = 16,
+) -> tuple[nn.Module, tuple[torch.Tensor, ...], list[str]]:
+    """Loads real altaidevorg/bge-m3-distill-8l checkpoint via sentence-transformers/transformers."""
+    from transformers import AutoModel
+
+    model = AutoModel.from_pretrained("altaidevorg/bge-m3-distill-8l").eval()
+    input_ids = torch.randint(10, 1000, (1, seq_len), dtype=torch.int32)
+    example_input = (input_ids,)
+    input_names = ["input_ids"]
+
+    class BGEM3Wrapper(nn.Module):
+        def __init__(self, base):
+            super().__init__()
+            self.word_embeddings = base.embeddings.word_embeddings
+            self.position_embeddings = base.embeddings.position_embeddings
+            self.token_type_embeddings = base.embeddings.token_type_embeddings
+            self.LayerNorm = base.embeddings.LayerNorm
+            self.encoder = base.encoder
+            self.padding_idx = base.embeddings.padding_idx
+
+        def forward(self, input_ids):
+            cur_seq = input_ids.shape[-1]
+            pos_ids = torch.arange(
+                self.padding_idx + 1, self.padding_idx + 1 + cur_seq, dtype=torch.int32
+            ).unsqueeze(0)
+            token_type_ids = torch.zeros((1, cur_seq), dtype=torch.int32)
+            words_emb = self.word_embeddings(input_ids)
+            pos_emb = self.position_embeddings(pos_ids)
+            type_emb = self.token_type_embeddings(token_type_ids)
+            emb = self.LayerNorm(words_emb + pos_emb + type_emb)
+            out = self.encoder(emb)
+            return out.last_hidden_state
+
+    return BGEM3Wrapper(model), example_input, input_names
+
+
+def load_mobilenet_v3_model(
+    variant: str = "small",
+    resolution: int = 224,
+) -> tuple[nn.Module, tuple[torch.Tensor, ...], list[str]]:
+    """Loads torchvision MobileNetV3 checkpoint (small or large)."""
+    from torchvision import models
+
+    variant = variant.lower()
+    if variant == "large":
+        model = models.mobilenet_v3_large(weights=models.MobileNet_V3_Large_Weights.DEFAULT).eval()
+    else:
+        model = models.mobilenet_v3_small(weights=models.MobileNet_V3_Small_Weights.DEFAULT).eval()
+
+    example_input = (torch.randn(1, 3, resolution, resolution, dtype=torch.float32),)
+    input_names = ["x"]
+    return model, example_input, input_names
+
+
+def load_ssdlite320_mobilenet_v3_model() -> tuple[nn.Module, tuple[torch.Tensor, ...], list[str]]:
+    """Loads torchvision SSDLite320-MobileNetV3 object detection backbone + head checkpoint."""
+    from torchvision import models
+
+    model = models.detection.ssdlite320_mobilenet_v3_large(
+        weights=models.detection.SSDLite320_MobileNet_V3_Large_Weights.DEFAULT
+    ).eval()
+    example_input = (torch.randn(1, 3, 320, 320, dtype=torch.float32),)
+    input_names = ["images"]
+
+    class SSDLitePredictor(nn.Module):
+        def __init__(self, base):
+            super().__init__()
+            self.backbone = base.backbone
+            self.head = base.head
+
+        def forward(self, images):
+            features = self.backbone(images)
+            feature_list = list(features.values())
+            head_outputs = self.head(feature_list)
+            return head_outputs["bbox_regression"], head_outputs["cls_logits"]
+
+    return SSDLitePredictor(model), example_input, input_names
+
+
+def load_vit_model(
+    variant: str = "b_16",
+    resolution: int = 224,
+) -> tuple[nn.Module, tuple[torch.Tensor, ...], list[str]]:
+    """Loads torchvision Vision Transformer (ViT-B/16 or ViT-L/16) checkpoint."""
+    from torchvision import models
+
+    variant = variant.lower()
+    if variant == "l_16":
+        model = models.vit_l_16(weights=models.ViT_L_16_Weights.DEFAULT).eval()
+    else:
+        model = models.vit_b_16(weights=models.ViT_B_16_Weights.DEFAULT).eval()
+
+    example_input = (torch.randn(1, 3, resolution, resolution, dtype=torch.float32),)
+    input_names = ["x"]
+    return model, example_input, input_names
+
+
+def load_whisper_model(
+    component: str = "encoder",
+) -> tuple[nn.Module, tuple[torch.Tensor, ...], list[str]]:
+    """Loads OpenAI Whisper model (tiny variant) encoder or decoder."""
+    from transformers import WhisperForConditionalGeneration
+
+    model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-tiny").eval()
+
+    if component == "encoder":
+        enc = model.model.encoder
+        example_input = (torch.randn(1, 80, 3000, dtype=torch.float32),)
+        input_names = ["input_features"]
+        return enc, example_input, input_names
+    elif component == "decoder":
+        dec = model.model.decoder
+
+        class WhisperDecoderPredictor(nn.Module):
+            def __init__(self, dec):
+                super().__init__()
+                self.dec = dec
+
+            def forward(self, input_ids, encoder_hidden_states):
+                h = self.dec.embed_tokens(input_ids) + self.dec.embed_positions(input_ids)
+                h = self.dec.layers[0](h, encoder_hidden_states=encoder_hidden_states)[0]
+                return self.dec.layer_norm(h)
+
+        example_input = (
+            torch.tensor([[50258, 50259, 50359]], dtype=torch.long),
+            torch.randn(1, 1500, 384, dtype=torch.float32),
+        )
+        input_names = ["input_ids", "encoder_hidden_states"]
+        return WhisperDecoderPredictor(dec), example_input, input_names
+    else:
+        raise ValueError(f"Unknown Whisper component: {component}")
+
+
+def load_convnext_model(
+    variant: str = "tiny",
+    resolution: int = 224,
+) -> tuple[nn.Module, tuple[torch.Tensor, ...], list[str]]:
+    """Loads torchvision ConvNeXt (tiny or small) model."""
+    from torchvision import models
+
+    variant = variant.lower()
+    if variant == "small":
+        model = models.convnext_small(weights=models.ConvNeXt_Small_Weights.DEFAULT).eval()
+    else:
+        model = models.convnext_tiny(weights=models.ConvNeXt_Tiny_Weights.DEFAULT).eval()
+
+    example_input = (torch.randn(1, 3, resolution, resolution, dtype=torch.float32),)
+    input_names = ["x"]
+    return model, example_input, input_names
+
+
+def load_efficientnet_model(
+    variant: str = "b0",
+    resolution: int = 224,
+) -> tuple[nn.Module, tuple[torch.Tensor, ...], list[str]]:
+    """Loads torchvision EfficientNet (b0 or v2_s) model."""
+    from torchvision import models
+
+    variant = variant.lower()
+    if variant == "v2_s":
+        model = models.efficientnet_v2_s(weights=models.EfficientNet_V2_S_Weights.DEFAULT).eval()
+    else:
+        model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.DEFAULT).eval()
+
+    example_input = (torch.randn(1, 3, resolution, resolution, dtype=torch.float32),)
+    input_names = ["x"]
+    return model, example_input, input_names
+
+
+def load_densenet_model(
+    variant: str = "densenet121",
+    resolution: int = 224,
+) -> tuple[nn.Module, tuple[torch.Tensor, ...], list[str]]:
+    """Loads torchvision DenseNet (densenet121) model."""
+    from torchvision import models
+
+    variant = variant.lower()
+    if variant == "densenet161":
+        model = models.densenet161(weights=models.DenseNet161_Weights.DEFAULT).eval()
+    else:
+        model = models.densenet121(weights=models.DenseNet121_Weights.DEFAULT).eval()
+
+    example_input = (torch.randn(1, 3, resolution, resolution, dtype=torch.float32),)
+    input_names = ["x"]
+    return model, example_input, input_names
+
+
+def load_regnet_model(
+    variant: str = "regnet_y_400mf",
+    resolution: int = 224,
+) -> tuple[nn.Module, tuple[torch.Tensor, ...], list[str]]:
+    """Loads torchvision RegNet (regnet_y_400mf) model with group convolutions."""
+    from torchvision import models
+
+    variant = variant.lower()
+    if variant == "regnet_y_800mf":
+        model = models.regnet_y_800mf(weights=models.RegNet_Y_800MF_Weights.DEFAULT).eval()
+    else:
+        model = models.regnet_y_400mf(weights=models.RegNet_Y_400MF_Weights.DEFAULT).eval()
+
+    example_input = (torch.randn(1, 3, resolution, resolution, dtype=torch.float32),)
+    input_names = ["x"]
+    return model, example_input, input_names
+
+
+def load_bert_model(
+    seq_len: int = 16,
+) -> tuple[nn.Module, tuple[torch.Tensor, ...], list[str]]:
+    """Loads real Hugging Face BERT-base-uncased checkpoint."""
+    from transformers import BertModel
+
+    model = BertModel.from_pretrained("bert-base-uncased").eval()
+    input_ids = torch.randint(0, 1000, (1, seq_len), dtype=torch.int32)
+    example_input = (input_ids,)
+    input_names = ["input_ids"]
+
+    class BertWrapper(nn.Module):
+        def __init__(self, base):
+            super().__init__()
+            self.base = base
+
+        def forward(self, input_ids):
+            out = self.base(input_ids=input_ids)
+            return out.last_hidden_state
+
+    return BertWrapper(model), example_input, input_names

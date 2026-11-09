@@ -1,0 +1,146 @@
+name: Build vica-laya runtime
+
+# Builds the vica-laya runner from the ggmlc snapshot in ggmlc/ for three platforms.
+# Every run checks the binary on CPU with the published model; a `v*` tag also attaches
+# the archives and SHA256SUMS to a GitHub release.
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  # Published model used only for the CPU check. Pin a Hugging Face commit, not main.
+  MODEL_URL: https://huggingface.co/tory-labs/vica-laya/resolve/a476161f88e8f91737533595168e85d09dcb8e14/laya_multilingual_q8_0.gguf
+  MODEL_SHA256: ba398461a6181e68350d0a88cf7885f53925ce440d2e97f3ea0096e4d8d9a721
+  CHECK_FILES: https://huggingface.co/tory-labs/vica-laya/resolve/a476161f88e8f91737533595168e85d09dcb8e14
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-arm64
+            os: macos-14
+            backend: metal
+          - name: linux-x86_64
+            os: ubuntu-22.04
+            backend: vulkan
+          - name: windows-x86_64
+            os: windows-2022
+            backend: vulkan
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Ninja
+        uses: ashutoshvarma/setup-ninja@master
+
+      - name: Set up MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install Vulkan SDK (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/lunarg-vulkan.gpg
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+          sudo apt-get update -y
+          sudo apt-get install -y build-essential vulkan-sdk libssl-dev
+
+      - name: Install Vulkan SDK (Windows)
+        if: runner.os == 'Windows'
+        env:
+          VULKAN_VERSION: 1.4.357.0
+        run: |
+          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
+
+      - name: Configure (macOS Metal)
+        if: matrix.backend == 'metal'
+        run: cmake -S ggmlc -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGMLC_ENABLE_METAL=ON -DGGML_NATIVE=OFF -DGGMLC_BUILD_EXAMPLES=ON
+
+      - name: Configure (Vulkan)
+        if: matrix.backend == 'vulkan'
+        run: cmake -S ggmlc -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGMLC_ENABLE_VULKAN=ON -DGGMLC_BUILD_EXAMPLES=ON
+
+      - name: Build
+        run: cmake --build build --config Release --target laya
+
+      - name: Name the binary vica-laya
+        shell: bash
+        run: |
+          mkdir -p out
+          if [ -f build/examples/laya/laya.exe ]; then
+            cp build/examples/laya/laya.exe out/vica-laya.exe; echo "EXE=out/vica-laya.exe" >> "$GITHUB_ENV"
+          else
+            cp build/examples/laya/laya out/vica-laya; echo "EXE=out/vica-laya" >> "$GITHUB_ENV"
+          fi
+
+      - name: Show linked libraries
+        continue-on-error: true
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            Linux) ldd "$EXE" ;;
+            macOS) otool -L "$EXE" ;;
+            Windows) dumpbin //dependents "$EXE" ;;
+          esac
+
+      - name: CPU check with the published model
+        shell: bash
+        run: |
+          mkdir -p check
+          curl -sSL -o check/model.gguf "$MODEL_URL"
+          echo "$MODEL_SHA256  check/model.gguf" | sha256sum -c - 2>/dev/null || echo "$MODEL_SHA256  check/model.gguf" | shasum -a 256 -c -
+          curl -sSL -o check/example-state.json "$CHECK_FILES/example-state.json"
+          curl -sSL -o check/topic-questions.json "$CHECK_FILES/topic-questions.json"
+          "$EXE" decide check/model.gguf --json --device cpu \
+            --state-file check/example-state.json --questions-file check/topic-questions.json \
+            > "check/decide-${{ matrix.name }}-cpu.json"
+          cat "check/decide-${{ matrix.name }}-cpu.json"
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          tar -czvf "dist/vica-laya-runtime-${{ matrix.name }}.tar.gz" -C out vica-laya
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          New-Item -ItemType Directory -Force -Path dist
+          Compress-Archive -Path out\vica-laya.exe -DestinationPath "dist\vica-laya-runtime-${{ matrix.name }}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vica-laya-runtime-${{ matrix.name }}
+          path: |
+            dist/*
+            check/decide-*.json
+
+  release:
+    name: Attach to release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          mkdir dist && cp artifacts/dist/* dist/
+          cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*

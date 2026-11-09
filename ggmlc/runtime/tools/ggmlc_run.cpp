@@ -1,0 +1,1051 @@
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+#include <unordered_map>
+#include <chrono>
+#include <cmath>
+#include <algorithm>
+#include <cstdlib>
+#include <iomanip>
+#if defined(_WIN32)
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
+#include "ggmlc/loader.h"
+#include "ggmlc/executor.h"
+#include "ggmlc/pipeline/image.h"
+#include "ggmlc/pipeline/tokenizer.h"
+#include "ggmlc/batch_scheduler.h"
+
+static inline bool is_stdout_tty() {
+#if defined(_WIN32)
+    return _isatty(_fileno(stdout)) != 0;
+#else
+    return isatty(fileno(stdout)) != 0;
+#endif
+}
+
+static std::string prog_base(const char* argv0) {
+    std::string s = argv0 ? argv0 : "ggmlc-run";
+    const auto p = s.find_last_of("/\\");
+    if (p != std::string::npos) s = s.substr(p + 1);
+    return s;
+}
+
+static bool is_ggmlc_run_command(const std::string& s) {
+    return s == "help" || s == "info" || s == "chat" || s == "prompt" || s == "serve" || s == "run";
+}
+
+static void print_help(const char* prog_name) {
+    const std::string p = prog_base(prog_name);
+    std::cout
+        << "ggmlc-run — execute a compiled GGUF neural program (chat, vision, raw tensors).\n\n"
+        << "Usage:\n"
+        << "  " << p << " <command> <model.gguf> [options]\n\n"
+        << "Commands:\n"
+        << "  help      Show this help\n"
+        << "  info      Inspect GGUF metadata, graph, and capabilities\n"
+        << "  chat      Instruction chat with the embedded template\n"
+        << "  prompt    Autoregressive continuation from a raw string\n"
+        << "  serve     Continuous-batching interactive session\n"
+        << "  run       One-shot graph execution (vision / raw tensors)  (default)\n\n"
+        << "HELP\n"
+        << "  " << p << " help\n\n"
+        << "  -h, --help                    Same as this command\n\n"
+        << "INFO\n"
+        << "  " << p << " info <model.gguf>\n\n"
+        << "  Print architecture, tasks, tokenizer/vision capabilities, inputs, outputs.\n\n"
+        << "  <model.gguf>                  Compiled GGUF\n\n"
+        << "CHAT\n"
+        << "  " << p << " chat <model.gguf> <message> [--system <MSG>] [--max-tokens <N>]\n"
+        << "              [--temperature <T>] [--top-p <P>] [--echo-prompt] [--show-special]\n"
+        << "              [--chunk-size <N>] [--ubatch <N>] [--device <cpu|cuda>]\n"
+        << "              [--threads <N>] [--cuda-graph] [--unplanned] [--symbol <k=v>]\n\n"
+        << "  Apply the chat template and stream only the assistant reply.\n\n"
+        << "  <model.gguf>                  Compiled GGUF with tokenizer metadata\n"
+        << "  <message>                     User turn\n"
+        << "  --system <MSG>                System instruction for the template\n"
+        << "  --max-tokens <N>              New tokens to generate  (default: 32)\n"
+        << "  --temperature <T>             Sampling temperature; 0 = greedy  (default: 0)\n"
+        << "  --top-p <P>                   Nucleus sampling cutoff  (default: 0.9)\n"
+        << "  --echo-prompt                 Print the formatted prompt before the reply\n"
+        << "  --show-special                Print special tokens instead of stopping silently\n"
+        << "  --chunk-size <N>, --ubatch <N>\n"
+        << "                                Prefill chunk size  (default: 128, 0 = one pass)\n"
+        << "  --device <cpu|cuda>           Execution device  (default: cpu)\n"
+        << "  --threads <N>                 CPU workers  (default: 1)\n"
+        << "  --cuda-graph                  Capture a CUDA graph for decode\n"
+        << "  --unplanned                   Disable arena reuse (debug)\n"
+        << "  --symbol <k=v>                Bind a dynamic dimension (e.g. s=128)\n\n"
+        << "PROMPT\n"
+        << "  " << p << " prompt <model.gguf> <string> [--max-tokens <N>] [--temperature <T>]\n"
+        << "                [--top-p <P>] [--echo-prompt] [--show-special] [--generate]\n"
+        << "                [--chunk-size <N>] [--ubatch <N>] [--device <cpu|cuda>]\n"
+        << "                [--threads <N>] [--cuda-graph] [--unplanned] [--symbol <k=v>]\n\n"
+        << "  Continue a raw prompt with no chat template.\n\n"
+        << "  <model.gguf>                  Compiled GGUF with tokenizer metadata\n"
+        << "  <string>                      Prompt text\n"
+        << "  --max-tokens <N>              New tokens to generate  (default: 32)\n"
+        << "  --temperature <T>             Sampling temperature; 0 = greedy  (default: 0)\n"
+        << "  --top-p <P>                   Nucleus sampling cutoff  (default: 0.9)\n"
+        << "  --echo-prompt                 Print the prompt before generated tokens\n"
+        << "  --show-special                Print special tokens instead of stopping silently\n"
+        << "  --generate                    Force the autoregressive loop\n"
+        << "  --chunk-size <N>, --ubatch <N>\n"
+        << "                                Prefill chunk size  (default: 128, 0 = one pass)\n"
+        << "  --device <cpu|cuda>           Execution device  (default: cpu)\n"
+        << "  --threads <N>                 CPU workers  (default: 1)\n"
+        << "  --cuda-graph                  Capture a CUDA graph for decode\n"
+        << "  --unplanned                   Disable arena reuse (debug)\n"
+        << "  --symbol <k=v>                Bind a dynamic dimension (e.g. s=128)\n\n"
+        << "SERVE\n"
+        << "  " << p << " serve <model.gguf> [--paged-kv] [--max-batch <N>]\n"
+        << "               [--gpu-utilization <R>] [--warm-blocks <N>] [--no-prefix-cache]\n"
+        << "               [--device <cpu|cuda>] [--threads <N>] [--cuda-graph]\n"
+        << "               [--chunk-size <N>] [--ubatch <N>]\n\n"
+        << "  Interactive continuous-batching session with optional Driver-VMM paging.\n\n"
+        << "  <model.gguf>                  Compiled GGUF with tokenizer metadata\n"
+        << "  --paged-kv                    Driver-VMM paged KV cache\n"
+        << "  --max-batch <N>               Concurrent requests  (default: 8)\n"
+        << "  --gpu-utilization <R>         Pre-allocate physical blocks to this VRAM fraction\n"
+        << "  --warm-blocks <N>             Warm 2 MB pages to keep  (default: 64)\n"
+        << "  --no-prefix-cache             Disable radix-tree prefix caching\n"
+        << "  --device <cpu|cuda>           Execution device  (default: cpu)\n"
+        << "  --threads <N>                 CPU workers  (default: 1)\n"
+        << "  --cuda-graph                  Multi-bucket CUDA graphs for decode\n"
+        << "  --chunk-size <N>, --ubatch <N>\n"
+        << "                                Prefill chunk size  (default: 128)\n\n"
+        << "RUN\n"
+        << "  " << p << " run <model.gguf> [--image <name:file>] [--text <name:str>]\n"
+        << "             [--input <name:file.bin>] [--output <id:file.bin>]\n"
+        << "             [--state-in <name:file.bin>] [--state-out <name:file.bin>]\n"
+        << "             [--device <cpu|cuda>] [--threads <N>] [--cuda-graph]\n"
+        << "             [--unplanned] [--symbol <k=v>]\n\n"
+        << "  Execute the graph once. Used for classification, embeddings, raw tensors.\n\n"
+        << "  <model.gguf>                  Compiled GGUF\n"
+        << "  --image <name:file>           Preprocess an image onto input tensor <name>\n"
+        << "  --text <name:str>             Tokenize a string onto input tensor <name>\n"
+        << "  --input <name:file.bin>       Load a raw tensor from a binary file\n"
+        << "  --output <id:file.bin>        Write output tensor <id> to a binary file\n"
+        << "  --state-in <name:file.bin>    Load a recurrent state\n"
+        << "  --state-out <name:file.bin>   Save a recurrent state\n"
+        << "  --device <cpu|cuda>           Execution device  (default: cpu)\n"
+        << "  --threads <N>                 CPU workers  (default: 1)\n"
+        << "  --cuda-graph                  Capture a CUDA graph\n"
+        << "  --unplanned                   Disable arena reuse (debug)\n"
+        << "  --symbol <k=v>                Bind a dynamic dimension (e.g. s=128)\n"
+        << std::endl;
+}
+
+static void print_model_info(const std::string& model_path, const ggmlc::SerializedModelGraph& g) {
+    std::cout << "================================================================================\n"
+              << " Model Information: " << model_path << "\n"
+              << "================================================================================\n"
+              << " Name:            " << g.name << "\n";
+
+    auto it_arch = g.metadata_str.find("general.architecture");
+    if (it_arch != g.metadata_str.end()) {
+        std::cout << " Architecture:    " << it_arch->second << "\n";
+    }
+
+    auto it_ver = g.metadata_str.find("ggmlc.version");
+    if (it_ver != g.metadata_str.end()) {
+        std::cout << " Compiler Ver:    " << it_ver->second << "\n";
+    }
+
+    auto tasks = g.get_tasks();
+    if (!tasks.empty()) {
+        std::cout << " Declared Tasks:  [";
+        for (size_t i = 0; i < tasks.size(); ++i) {
+            std::cout << tasks[i] << (i + 1 < tasks.size() ? ", " : "");
+        }
+        std::cout << "]\n";
+    } else {
+        std::cout << " Declared Tasks:  [none]\n";
+    }
+
+    std::cout << " Total Tensors:   " << g.tensors.size() << "\n"
+              << " Graph Ops:       " << g.ops.size() << "\n";
+
+    if (!g.symbol_table.empty()) {
+        std::cout << " Dynamic Symbols: ";
+        for (size_t i = 0; i < g.symbol_table.size(); ++i) {
+            std::cout << g.symbol_table[i] << (i + 1 < g.symbol_table.size() ? ", " : "");
+        }
+        std::cout << "\n";
+    }
+
+    std::cout << "\n Capabilities:\n"
+              << "   [" << (g.has_tokenizer() ? "x" : " ") << "] Tokenizer:      "
+              << (g.has_tokenizer() ? "Present in GGUF metadata" : "Not present") << "\n"
+              << "   [" << (g.has_chat_template() ? "x" : " ") << "] Chat Template:  "
+              << (g.has_chat_template() ? "Present in GGUF metadata" : "Not present") << "\n"
+              << "   [" << (g.has_vision() ? "x" : " ") << "] Vision Preproc: "
+              << (g.has_vision() ? "Present in GGUF metadata" : "Not present") << "\n";
+
+    std::cout << "\n Graph Inputs (" << g.inputs.size() << "):\n";
+    for (uint32_t tid : g.inputs) {
+        auto t_it = g.tensors.find(tid);
+        if (t_it != g.tensors.end()) {
+            std::cout << "   #" << tid << ": " << t_it->second.name << " (type: "
+                      << static_cast<int>(t_it->second.type) << ")\n";
+        }
+    }
+
+    std::cout << "\n Graph Outputs (" << g.outputs.size() << "):\n";
+    for (uint32_t tid : g.outputs) {
+        auto t_it = g.tensors.find(tid);
+        if (t_it != g.tensors.end()) {
+            std::cout << "   #" << tid << ": " << t_it->second.name << " (type: "
+                      << static_cast<int>(t_it->second.type) << ")\n";
+        }
+    }
+    std::cout << "================================================================================\n";
+}
+
+static int32_t sample_token(const float* last_logits, int64_t vocab_size, float temperature, float top_p) {
+    if (temperature <= 0.0f) {
+        float max_val = -1e30f;
+        int32_t next_token = 0;
+        for (int64_t v = 0; v < vocab_size; ++v) {
+            if (last_logits[v] > max_val) {
+                max_val = last_logits[v];
+                next_token = static_cast<int32_t>(v);
+            }
+        }
+        return next_token;
+    }
+
+    std::vector<std::pair<float, int32_t>> probs(vocab_size);
+    float max_l = -1e30f;
+    for (int64_t v = 0; v < vocab_size; ++v) {
+        if (last_logits[v] > max_l) max_l = last_logits[v];
+    }
+    float sum_exp = 0.0f;
+    for (int64_t v = 0; v < vocab_size; ++v) {
+        float p = std::exp((last_logits[v] - max_l) / std::max(temperature, 1e-5f));
+        probs[v] = {p, static_cast<int32_t>(v)};
+        sum_exp += p;
+    }
+    for (auto& pair : probs) {
+        pair.first /= sum_exp;
+    }
+
+    if (top_p < 1.0f) {
+        std::sort(probs.begin(), probs.end(), [](const auto& a, const auto& b) {
+            return a.first > b.first;
+        });
+        float cumsum = 0.0f;
+        size_t cutoff = 1;
+        for (size_t k = 0; k < probs.size(); ++k) {
+            cumsum += probs[k].first;
+            if (cumsum > top_p && k > 0) {
+                cutoff = k + 1;
+                break;
+            }
+        }
+        probs.resize(cutoff);
+        float new_sum = 0.0f;
+        for (const auto& p : probs) new_sum += p.first;
+        for (auto& p : probs) p.first /= new_sum;
+    }
+
+    float r = static_cast<float>(std::rand()) / static_cast<float>(RAND_MAX);
+    float acc = 0.0f;
+    int32_t next_token = probs[0].second;
+    for (const auto& p : probs) {
+        acc += p.first;
+        if (r <= acc) {
+            next_token = p.second;
+            break;
+        }
+    }
+    return next_token;
+}
+
+int main(int argc, char** argv) {
+    if (argc < 2) {
+        print_help(argv[0]);
+        return 1;
+    }
+
+    std::string first_arg = argv[1];
+    if (first_arg == "--help" || first_arg == "-h" || first_arg == "help") {
+        print_help(argv[0]);
+        return 0;
+    }
+    if (!is_ggmlc_run_command(first_arg)) {
+        std::cerr << "unknown command: " << first_arg << "\n";
+        print_help(argv[0]);
+        return 1;
+    }
+    const std::string command = first_arg;
+    const int argi = 2;
+
+    std::string model_path;
+    std::unordered_map<std::string, std::string> input_files;
+    std::unordered_map<std::string, std::string> image_files;
+    std::unordered_map<std::string, std::string> text_inputs;
+    std::unordered_map<uint32_t, std::string> output_files;
+    std::unordered_map<std::string, std::string> state_in_files;
+    std::unordered_map<std::string, std::string> state_out_files;
+    std::unordered_map<std::string, int64_t> symbol_env;
+
+    std::string prompt_text;
+    std::string chat_text;
+    std::string system_text;
+    bool is_generate = false;
+    bool show_info = false;
+    bool echo_prompt = false;
+    bool show_special = false;
+    int max_tokens = 32;
+    float temperature = 0.0f;
+    float top_p = 0.9f;
+
+    std::string device_name = "cpu";
+    int n_threads = 1;
+    int chunk_size = 128;
+    bool unplanned = false;
+    bool use_cuda_graph = false;
+    bool use_paged_kv = false;
+    bool is_serve_mode = false;
+    int max_batch = 8;
+    float gpu_utilization = 0.0f;
+    int warm_blocks = 64;
+    bool enable_prefix_cache = true;
+
+    for (int i = argi; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--help" || arg == "-h") {
+            print_help(argv[0]);
+            return 0;
+        } else if (arg == "--model" && i + 1 < argc) {
+            model_path = argv[++i];
+        } else if (arg == "--cuda-graph") {
+            use_cuda_graph = true;
+        } else if (arg == "--system" && i + 1 < argc) {
+            system_text = argv[++i];
+        } else if (arg == "--generate") {
+            is_generate = true;
+        } else if (arg == "--echo-prompt") {
+            echo_prompt = true;
+        } else if (arg == "--show-special") {
+            show_special = true;
+        } else if (arg == "--max-tokens" && i + 1 < argc) {
+            max_tokens = std::stoi(argv[++i]);
+        } else if (arg == "--temperature" && i + 1 < argc) {
+            temperature = std::stof(argv[++i]);
+        } else if (arg == "--top-p" && i + 1 < argc) {
+            top_p = std::stof(argv[++i]);
+        } else if (arg == "--input" && i + 1 < argc) {
+            std::string val = argv[++i];
+            size_t colon = val.find(':');
+            if (colon != std::string::npos) {
+                input_files[val.substr(0, colon)] = val.substr(colon + 1);
+            }
+        } else if (arg == "--image" && i + 1 < argc) {
+            std::string val = argv[++i];
+            size_t colon = val.find(':');
+            if (colon != std::string::npos) {
+                image_files[val.substr(0, colon)] = val.substr(colon + 1);
+            }
+        } else if (arg == "--text" && i + 1 < argc) {
+            std::string val = argv[++i];
+            size_t colon = val.find(':');
+            if (colon != std::string::npos) {
+                text_inputs[val.substr(0, colon)] = val.substr(colon + 1);
+            }
+        } else if (arg == "--device" && i + 1 < argc) {
+            device_name = argv[++i];
+        } else if (arg == "--output" && i + 1 < argc) {
+            std::string val = argv[++i];
+            size_t colon = val.find(':');
+            if (colon != std::string::npos) {
+                uint32_t tid = std::stoul(val.substr(0, colon));
+                output_files[tid] = val.substr(colon + 1);
+            }
+        } else if (arg == "--state-in" && i + 1 < argc) {
+            std::string val = argv[++i];
+            size_t colon = val.find(':');
+            if (colon != std::string::npos) {
+                state_in_files[val.substr(0, colon)] = val.substr(colon + 1);
+            }
+        } else if (arg == "--state-out" && i + 1 < argc) {
+            std::string val = argv[++i];
+            size_t colon = val.find(':');
+            if (colon != std::string::npos) {
+                state_out_files[val.substr(0, colon)] = val.substr(colon + 1);
+            }
+        } else if (arg == "--symbol" && i + 1 < argc) {
+            std::string val = argv[++i];
+            size_t eq = val.find('=');
+            if (eq != std::string::npos) {
+                symbol_env[val.substr(0, eq)] = std::stoll(val.substr(eq + 1));
+            }
+        } else if (arg == "--threads" && i + 1 < argc) {
+            n_threads = std::stoi(argv[++i]);
+        } else if ((arg == "--chunk-size" || arg == "--ubatch") && i + 1 < argc) {
+            chunk_size = std::stoi(argv[++i]);
+        } else if (arg == "--unplanned") {
+            unplanned = true;
+        } else if (arg == "--paged-kv") {
+            use_paged_kv = true;
+        } else if (arg == "--max-batch" && i + 1 < argc) {
+            max_batch = std::stoi(argv[++i]);
+        } else if (arg == "--gpu-utilization" && i + 1 < argc) {
+            gpu_utilization = std::stof(argv[++i]);
+            use_paged_kv = true;
+        } else if (arg == "--warm-blocks" && i + 1 < argc) {
+            warm_blocks = std::stoi(argv[++i]);
+            use_paged_kv = true;
+        } else if (arg == "--no-prefix-cache") {
+            enable_prefix_cache = false;
+        } else if (!arg.empty() && arg[0] != '-') {
+            if (model_path.empty()) {
+                model_path = arg;
+            } else if (command == "chat" && chat_text.empty()) {
+                chat_text = arg;
+                is_generate = true;
+            } else if (command == "prompt" && prompt_text.empty()) {
+                prompt_text = arg;
+                is_generate = true;
+            } else {
+                std::cerr << "unknown argument: " << arg << "\n";
+                print_help(argv[0]);
+                return 1;
+            }
+        } else {
+            std::cerr << "unknown argument: " << arg << "\n";
+            print_help(argv[0]);
+            return 1;
+        }
+    }
+
+    if (command == "info") show_info = true;
+    if (command == "serve") is_serve_mode = true;
+    if (command == "chat") {
+        is_generate = true;
+        if (chat_text.empty()) {
+            std::cerr << "Error: chat requires <message>.\n";
+            print_help(argv[0]);
+            return 1;
+        }
+    }
+    if (command == "prompt") {
+        is_generate = true;
+        if (prompt_text.empty()) {
+            std::cerr << "Error: prompt requires <string>.\n";
+            print_help(argv[0]);
+            return 1;
+        }
+    }
+
+    if (model_path.empty()) {
+        std::cerr << "Error: pass <model.gguf>.\n";
+        print_help(argv[0]);
+        return 1;
+    }
+
+    try {
+        auto model_graph = ggmlc::ModelLoader::load_from_file(model_path);
+
+        if (show_info) {
+            print_model_info(model_path, model_graph);
+            return 0;
+        }
+
+        // Validate argument compatibility against model capabilities
+        if (!image_files.empty() && !model_graph.has_vision()) {
+            std::cerr << "[ggmlc-run ERROR] Model '" << model_graph.name
+                      << "' does not specify an image preprocessing pipeline in its GGUF metadata.\n"
+                      << "  Cannot use '--image'. If this model requires raw image tensors, provide them via '--input <name:file.bin>'.\n";
+            return 1;
+        }
+
+        if (!text_inputs.empty() && !model_graph.has_tokenizer()) {
+            std::cerr << "[ggmlc-run ERROR] Model '" << model_graph.name
+                      << "' does not specify tokenizer metadata in its GGUF container.\n"
+                      << "  Cannot use '--text'. Provide token IDs via '--input <name:file.bin>'.\n";
+            return 1;
+        }
+
+        if ((!prompt_text.empty() || is_generate) && chat_text.empty() && !model_graph.has_tokenizer()) {
+            std::cerr << "[ggmlc-run ERROR] Model '" << model_graph.name
+                      << "' does not contain tokenizer metadata for text generation.\n"
+                      << "  Cannot use 'prompt' or '--generate'.\n";
+            return 1;
+        }
+
+        if (!chat_text.empty()) {
+            if (!model_graph.has_tokenizer()) {
+                std::cerr << "[ggmlc-run ERROR] Model '" << model_graph.name
+                          << "' does not contain tokenizer metadata. Cannot use 'chat'.\n";
+                return 1;
+            }
+            if (!model_graph.has_chat_template()) {
+                std::cerr << "[ggmlc-run NOTICE] Model '" << model_graph.name
+                          << "' does not define a chat template in its GGUF metadata. Using standard prompt format.\n";
+            }
+        }
+
+        std::cout << "[ggmlc-run] Loaded model '" << model_graph.name << "' with "
+                  << model_graph.tensors.size() << " tensors and "
+                  << model_graph.ops.size() << " operations"
+                  << (unplanned ? " (UNPLANNED / NO REUSE)" : " (PLANNED ARENA REUSE)") << ".\n";
+
+        // Initialize tokenizer from model GGUF file if available
+        ggmlc::pipeline::BPETokenizer tokenizer;
+        bool has_tokenizer = tokenizer.init_from_gguf_file(model_path);
+
+        if (is_serve_mode) {
+            if (!has_tokenizer) {
+                std::cerr << "[ggmlc-run ERROR] Model does not contain tokenizer metadata. Cannot use 'serve'.\n";
+                return 1;
+            }
+            std::cout << "================================================================================\n"
+                      << "[ggmlc-run SERVER] High-Throughput Continuous Batching Engine\n"
+                      << "  Model:        " << model_path << "\n"
+                      << "  Device:       " << device_name << "\n"
+                      << "  Max Batch:    " << max_batch << "\n"
+                      << "  Paged KV:     Driver-VMM cuMemMap (Zero-Copy Physical Allocation)\n"
+                      << "  Prefix Cache: " << (enable_prefix_cache ? "Paged Radix Tree (Zero-Compute Sharing)" : "Disabled") << "\n"
+                      << "  Warm Pool:    " << warm_blocks << " blocks" << (gpu_utilization > 0.0f ? " (Upfront Pre-allocation)" : " (Elastic Recycling)") << "\n"
+                      << "  CUDA Graphs:  " << (use_cuda_graph ? "Multi-Bucket (B in {1, 2, 4, 8, 16})" : "Disabled") << "\n"
+                      << "================================================================================\n";
+            ggmlc::ModelExecutor executor(model_graph, device_name);
+            executor.set_logits_last_only(true);
+            executor.init_paged_kv_cache(max_batch, 2048);
+            size_t prealloc = 0;
+            if (gpu_utilization > 0.0f) {
+                prealloc = static_cast<size_t>(gpu_utilization * (warm_blocks > 0 ? warm_blocks : 128));
+            }
+            executor.configure_vmm_pool(warm_blocks, prealloc);
+            ggmlc::ContinuousBatchScheduler scheduler(executor, max_batch, tokenizer.eos_token_id());
+            scheduler.enable_prefix_caching(enable_prefix_cache);
+
+            std::cout << "[ggmlc-run SERVER] Ready. Submit prompt (or type 'exit' to quit):\n> " << std::flush;
+            std::string line;
+            while (std::getline(std::cin, line)) {
+                if (line == "exit" || line == "quit") break;
+                if (line.empty()) {
+                    std::cout << "> " << std::flush;
+                    continue;
+                }
+
+                std::string formatted = line;
+                if (model_graph.has_chat_template()) {
+                    formatted = tokenizer.apply_chat_template(line, system_text, true);
+                }
+                std::vector<int32_t> p_tokens = tokenizer.encode(formatted, 0, false, false);
+                if (p_tokens.empty()) p_tokens.push_back(0);
+                uint64_t req_id = scheduler.add_request(p_tokens, max_tokens, temperature, tokenizer.eos_token_id());
+                std::cout << "[Request #" << req_id << " Queued] (" << p_tokens.size() << " prompt tokens)\n";
+
+                bool flush_per_token = is_stdout_tty();
+                while (scheduler.has_work()) {
+                    auto res = scheduler.step();
+                    for (const auto& pair : res.new_tokens) {
+                        int32_t tok = pair.second;
+                        if (tokenizer.eos_token_id() >= 0 && tok == tokenizer.eos_token_id()) {
+                            continue;
+                        }
+                        if (tokenizer.is_special_token(tok)) {
+                            if (show_special) {
+                                std::cout << tokenizer.decode({tok}, false);
+                                if (flush_per_token) std::cout << std::flush;
+                            }
+                            continue;
+                        }
+                        std::cout << tokenizer.decode_token(tok, true);
+                        if (flush_per_token) std::cout << std::flush;
+                    }
+                    if (!res.completed_request_ids.empty()) {
+                        std::cout << "\n[Request Completed]\n";
+                    }
+                }
+                std::cout << std::flush;
+                std::cout << "\n> " << std::flush;
+            }
+            return 0;
+        }
+
+        // ====================================================================
+        // Mode A: Autoregressive Text Generation & Interactive Chat
+        // ====================================================================
+        if (is_generate || !chat_text.empty() || !prompt_text.empty()) {
+            if (!has_tokenizer) {
+                std::cerr << "[ggmlc-run ERROR] Failed to initialize tokenizer from GGUF metadata.\n";
+                return 1;
+            }
+
+            if (model_graph.inputs.empty() || model_graph.outputs.empty()) {
+                std::cerr << "[ggmlc-run ERROR] Model graph has no input or output tensors.\n";
+                return 1;
+            }
+
+            uint32_t in_tid = model_graph.inputs[0];
+            uint32_t out_tid = model_graph.outputs[0];
+
+            int32_t pos_tid = -1;
+            for (uint32_t inp : model_graph.inputs) {
+                auto it = model_graph.tensors.find(inp);
+                if (it != model_graph.tensors.end()) {
+                    if (it->second.name == "position_ids" || it->second.name.find("pos") != std::string::npos) {
+                        pos_tid = static_cast<int32_t>(inp);
+                        break;
+                    }
+                }
+            }
+
+            std::string formatted_prompt;
+            bool is_chat_mode = !chat_text.empty();
+            if (is_chat_mode) {
+                formatted_prompt = tokenizer.apply_chat_template(chat_text, system_text, true);
+            } else if (!prompt_text.empty()) {
+                formatted_prompt = prompt_text;
+            } else {
+                formatted_prompt = "Hello";
+            }
+
+            std::vector<int32_t> current_tokens = tokenizer.encode(formatted_prompt, 0, false, false);
+            if (current_tokens.empty()) {
+                current_tokens.push_back(tokenizer.bos_token_id() >= 0 ? tokenizer.bos_token_id() : 0);
+            }
+
+            std::cout << "[ggmlc-run] Prompt tokens: " << current_tokens.size() << "\n";
+            std::cout << "[ggmlc-run] Generating (" << max_tokens << " max tokens, temp="
+                      << temperature << ", device=" << device_name << "):\n\n";
+
+            // If prompt echo was explicitly requested, or if in raw prompt mode, print prompt
+            if (echo_prompt) {
+                std::cout << formatted_prompt << std::flush;
+            } else if (!is_chat_mode) {
+                std::cout << formatted_prompt << std::flush;
+            }
+
+            ggmlc::ModelExecutor executor(model_graph, device_name);
+            if (use_cuda_graph) {
+                executor.set_enable_cuda_graph(true);
+            }
+            // Match llama.cpp: only last-token logits for sampling.
+            executor.set_logits_last_only(true);
+            bool flush_per_token = is_stdout_tty();
+            auto t_start = std::chrono::high_resolution_clock::now();
+            auto t_prefill_end = t_start;
+            auto t_decode_start = t_start;
+            int generated_count = 0;
+
+            bool use_kv_cache = false;
+            for (const auto& op : model_graph.ops) {
+                if (op.opcode == 74) { // GGML_OP_FLASH_ATTN_EXT
+                    use_kv_cache = true;
+                    break;
+                }
+            }
+
+            if (use_kv_cache) {
+                if (use_paged_kv) {
+                    executor.init_paged_kv_cache(max_batch, current_tokens.size() + max_tokens + 256);
+                    size_t prealloc = 0;
+                    if (gpu_utilization > 0.0f) {
+                        prealloc = static_cast<size_t>(gpu_utilization * (warm_blocks > 0 ? warm_blocks : 128));
+                    }
+                    executor.configure_vmm_pool(warm_blocks, prealloc);
+                    executor.paged_kv_alloc_slot(0);
+                    executor.paged_kv_ensure_tokens(0, current_tokens.size() + max_tokens + 256);
+                } else {
+                    executor.init_kv_cache(current_tokens.size() + max_tokens + 256);
+                }
+            }
+
+            int64_t prompt_len = static_cast<int64_t>(current_tokens.size());
+            int64_t pos = 0;
+            int32_t last_token = 0;
+            bool stopped = false;
+
+            int64_t effective_chunk_size = (chunk_size > 0 && use_kv_cache) ? chunk_size : prompt_len;
+            int64_t n_chunks = (prompt_len + effective_chunk_size - 1) / effective_chunk_size;
+            if (n_chunks > 1) {
+                std::cout << "[ggmlc-run] Chunked prefill enabled: " << n_chunks
+                          << " chunks (chunk_size=" << effective_chunk_size << ")\n";
+            }
+
+            // Phase 1: Prompt Prefill (Chunked or Full)
+            for (int64_t chunk_idx = 0; chunk_idx < n_chunks; ++chunk_idx) {
+                int64_t c_start = chunk_idx * effective_chunk_size;
+                int64_t c_len = std::min<int64_t>(effective_chunk_size, prompt_len - c_start);
+                pos = c_start;
+
+                symbol_env["s"] = c_len;
+                for (const auto& sym : model_graph.symbol_table) {
+                    if (sym.rfind("s", 0) == 0 || sym.find("seq") != std::string::npos) {
+                        symbol_env[sym] = c_len;
+                    }
+                }
+                if (model_graph.symbol_table.size() == 1) {
+                    symbol_env[model_graph.symbol_table[0]] = c_len;
+                }
+
+                // Auto-deduce any symbolic dimensions in input tensor
+                for (const auto& dim_expr : model_graph.tensors[in_tid].ne) {
+                    if (dim_expr && dim_expr->type == ggmlc::DimType::SYMBOL) {
+                        int64_t sym_idx = dim_expr->val;
+                        if (sym_idx >= 0 && sym_idx < static_cast<int64_t>(model_graph.symbol_table.size())) {
+                            symbol_env[model_graph.symbol_table[sym_idx]] = c_len;
+                        }
+                    }
+                }
+                if (pos_tid >= 0) {
+                    for (const auto& dim_expr : model_graph.tensors[pos_tid].ne) {
+                        if (dim_expr && dim_expr->type == ggmlc::DimType::SYMBOL) {
+                            int64_t sym_idx = dim_expr->val;
+                            if (sym_idx >= 0 && sym_idx < static_cast<int64_t>(model_graph.symbol_table.size())) {
+                                symbol_env[model_graph.symbol_table[sym_idx]] = c_len;
+                            }
+                        }
+                    }
+                }
+
+                if (use_kv_cache) {
+                    symbol_env["pos"] = pos;
+                }
+
+                executor.prepare(symbol_env, !unplanned);
+                executor.set_input(in_tid, current_tokens.data() + c_start, c_len * sizeof(int32_t));
+                if (pos_tid >= 0) {
+                    std::vector<int32_t> pos_vec(c_len);
+                    for (int64_t i = 0; i < c_len; ++i) {
+                        pos_vec[i] = static_cast<int32_t>(c_start + i);
+                    }
+                    executor.set_input(pos_tid, pos_vec.data(), c_len * sizeof(int32_t));
+                }
+                executor.run(n_threads);
+
+                if (chunk_idx == n_chunks - 1) {
+                    t_prefill_end = std::chrono::high_resolution_clock::now();
+                    t_decode_start = t_prefill_end;
+
+                    if (max_tokens > 0) {
+                        const float* logits_data = static_cast<const float*>(executor.get_output_data(out_tid));
+                        size_t total_elements = executor.get_tensor_size_bytes(out_tid) / sizeof(float);
+                        auto out_shape = executor.get_tensor_shape(out_tid);
+                        int64_t vocab_size = 0;
+                        const float* last_logits = nullptr;
+                        if (out_shape.size() >= 2 && out_shape[1] == 1) {
+                            vocab_size = out_shape[0];
+                            last_logits = logits_data;
+                        } else {
+                            vocab_size = static_cast<int64_t>(total_elements / static_cast<size_t>((c_len > 0) ? c_len : 1));
+                            if (vocab_size <= 0) {
+                                vocab_size = static_cast<int64_t>(tokenizer.vocab_size());
+                            }
+                            last_logits = logits_data + (c_len - 1) * vocab_size;
+                        }
+
+                        int32_t next_token = sample_token(last_logits, vocab_size, temperature, top_p);
+
+                        last_token = next_token;
+                        current_tokens.push_back(next_token);
+                        generated_count++;
+                        pos = prompt_len;
+
+                        if (tokenizer.eos_token_id() >= 0 && next_token == tokenizer.eos_token_id()) {
+                            stopped = true;
+                            break;
+                        }
+                        if (tokenizer.is_special_token(next_token)) {
+                            if (show_special) {
+                                std::cout << tokenizer.decode({next_token}, false);
+                                if (flush_per_token) std::cout << std::flush;
+                            }
+                            stopped = true;
+                            break;
+                        }
+
+                        std::string piece = tokenizer.decode_token(next_token, true);
+                        std::cout << piece;
+                        if (flush_per_token) std::cout << std::flush;
+                    }
+                }
+            }
+
+            // Phase 2: Token-by-Token Decode (S = 1)
+            while (generated_count < max_tokens && !stopped) {
+                int64_t S = 1;
+                symbol_env["s"] = S;
+                for (const auto& sym : model_graph.symbol_table) {
+                    if (sym.rfind("s", 0) == 0 || sym.find("seq") != std::string::npos) {
+                        symbol_env[sym] = S;
+                    }
+                }
+                if (model_graph.symbol_table.size() == 1) {
+                    symbol_env[model_graph.symbol_table[0]] = S;
+                }
+
+                for (const auto& dim_expr : model_graph.tensors[in_tid].ne) {
+                    if (dim_expr && dim_expr->type == ggmlc::DimType::SYMBOL) {
+                        int64_t sym_idx = dim_expr->val;
+                        if (sym_idx >= 0 && sym_idx < static_cast<int64_t>(model_graph.symbol_table.size())) {
+                            symbol_env[model_graph.symbol_table[sym_idx]] = S;
+                        }
+                    }
+                }
+                if (pos_tid >= 0) {
+                    for (const auto& dim_expr : model_graph.tensors[pos_tid].ne) {
+                        if (dim_expr && dim_expr->type == ggmlc::DimType::SYMBOL) {
+                            int64_t sym_idx = dim_expr->val;
+                            if (sym_idx >= 0 && sym_idx < static_cast<int64_t>(model_graph.symbol_table.size())) {
+                                symbol_env[model_graph.symbol_table[sym_idx]] = S;
+                            }
+                        }
+                    }
+                }
+
+                if (use_kv_cache) {
+                    symbol_env["pos"] = pos;
+                }
+
+                executor.prepare(symbol_env, !unplanned);
+                if (use_kv_cache) {
+                    executor.set_input(in_tid, &last_token, sizeof(int32_t));
+                } else {
+                    executor.set_input(in_tid, current_tokens.data(), current_tokens.size() * sizeof(int32_t));
+                }
+                if (pos_tid >= 0) {
+                    int32_t cur_pos = static_cast<int32_t>(pos);
+                    executor.set_input(pos_tid, &cur_pos, sizeof(int32_t));
+                }
+                executor.run(n_threads);
+
+                const float* logits_data = static_cast<const float*>(executor.get_output_data(out_tid));
+                size_t total_elements = executor.get_tensor_size_bytes(out_tid) / sizeof(float);
+                auto out_shape = executor.get_tensor_shape(out_tid);
+                int64_t vocab_size = 0;
+                const float* last_logits = nullptr;
+                if (out_shape.size() >= 2 && out_shape[1] == 1) {
+                    vocab_size = out_shape[0];
+                    last_logits = logits_data;
+                } else {
+                    vocab_size = static_cast<int64_t>(total_elements / static_cast<size_t>((S > 0) ? S : 1));
+                    if (vocab_size <= 0) {
+                        vocab_size = static_cast<int64_t>(tokenizer.vocab_size());
+                    }
+                    last_logits = logits_data + (S - 1) * vocab_size;
+                }
+                int32_t next_token = sample_token(last_logits, vocab_size, temperature, top_p);
+
+                last_token = next_token;
+                current_tokens.push_back(next_token);
+                generated_count++;
+                if (use_kv_cache) {
+                    pos++;
+                }
+
+                if (tokenizer.eos_token_id() >= 0 && next_token == tokenizer.eos_token_id()) {
+                    break;
+                }
+                if (tokenizer.is_special_token(next_token)) {
+                    if (show_special) {
+                        std::cout << tokenizer.decode({next_token}, false);
+                        if (flush_per_token) std::cout << std::flush;
+                    }
+                    break;
+                }
+
+                std::string piece = tokenizer.decode_token(next_token, true);
+                std::cout << piece;
+                if (flush_per_token) std::cout << std::flush;
+            }
+
+            std::cout << std::flush;
+            auto t_end = std::chrono::high_resolution_clock::now();
+            double total_sec = std::chrono::duration<double>(t_end - t_start).count();
+            double prefill_sec = std::chrono::duration<double>(t_prefill_end - t_start).count();
+            int decode_count = std::max(0, generated_count - 1);
+            double decode_sec = decode_count > 0 ? std::chrono::duration<double>(t_end - t_decode_start).count() : 0.0;
+            double decode_ms_tok = decode_count > 0 ? (decode_sec * 1000.0 / decode_count) : 0.0;
+            double decode_tok_s = decode_sec > 1e-6 ? (decode_count / decode_sec) : 0.0;
+
+            std::cout << "\n\n[ggmlc-run] Summary: " << generated_count << " tokens generated in "
+                      << std::fixed << std::setprecision(2) << total_sec << "s ("
+                      << (generated_count / std::max(total_sec, 1e-6)) << " tok/s overall)\n"
+                      << "[ggmlc-run]   Prompt Prefill : " << prompt_len << " tokens in "
+                      << std::fixed << std::setprecision(2) << (prefill_sec * 1000.0) << " ms ("
+                      << (prompt_len / std::max(prefill_sec, 1e-6)) << " tok/s)\n"
+                      << "[ggmlc-run]   Token Decode   : " << decode_count << " tokens in "
+                      << std::fixed << std::setprecision(2) << (decode_sec * 1000.0) << " ms ("
+                      << decode_tok_s << " tok/s, " << decode_ms_tok << " ms/tok)\n";
+
+            return 0;
+        }
+
+        // ====================================================================
+        // Mode B: Standard One-Shot Graph Execution
+        // ====================================================================
+        ggmlc::ModelExecutor executor(model_graph, device_name);
+        if (use_cuda_graph) {
+            executor.set_enable_cuda_graph(true);
+        }
+        // Raw one-shot execution returns the full graph output. Last-token
+        // gather is only for chat / prompt / serve sampling.
+        executor.prepare(symbol_env, !unplanned);
+
+        // Load initial state data if provided
+        for (const auto& pair : state_in_files) {
+            std::ifstream fin(pair.second, std::ios::binary | std::ios::ate);
+            if (!fin.is_open()) {
+                std::cerr << "Failed to open state-in file: " << pair.second << "\n";
+                return 1;
+            }
+            size_t sz = fin.tellg();
+            fin.seekg(0, std::ios::beg);
+            std::vector<uint8_t> buf(sz);
+            fin.read(reinterpret_cast<char*>(buf.data()), sz);
+
+            executor.set_state_by_name(pair.first, buf.data(), sz);
+            std::cout << "[ggmlc-run] Loaded state '" << pair.first << "' (" << sz << " bytes)\n";
+        }
+
+        // Load input data
+        for (const auto& pair : input_files) {
+            std::ifstream fin(pair.second, std::ios::binary | std::ios::ate);
+            if (!fin.is_open()) {
+                std::cerr << "Failed to open input file: " << pair.second << "\n";
+                return 1;
+            }
+            size_t sz = fin.tellg();
+            fin.seekg(0, std::ios::beg);
+            std::vector<uint8_t> buf(sz);
+            fin.read(reinterpret_cast<char*>(buf.data()), sz);
+
+            executor.set_input_by_name(pair.first, buf.data(), sz);
+            std::cout << "[ggmlc-run] Loaded input '" << pair.first << "' (" << sz << " bytes)\n";
+        }
+
+        // Load and preprocess image inputs
+        for (const auto& pair : image_files) {
+            int target_w = 224;
+            int target_h = 224;
+            auto it_size = model_graph.metadata_int.find("clip.vision.image_size");
+            if (it_size != model_graph.metadata_int.end() && it_size->second > 0) {
+                target_w = static_cast<int>(it_size->second);
+                target_h = target_w;
+            }
+            auto img_tensor = ggmlc::pipeline::ImagePreprocessor::preprocess_file(pair.second, target_w, target_h);
+            executor.set_input_by_name(pair.first, img_tensor.data.data(), img_tensor.data.size() * sizeof(float));
+            std::cout << "[ggmlc-run] Preprocessed image '" << pair.first << "' from " << pair.second
+                      << " (" << img_tensor.channels << "x" << img_tensor.height << "x" << img_tensor.width << ")\n";
+        }
+
+        // Tokenize and load text inputs
+        for (const auto& pair : text_inputs) {
+            auto tokens = tokenizer.encode(pair.second, 0, true, false);
+            executor.set_input_by_name(pair.first, tokens.data(), tokens.size() * sizeof(int32_t));
+            std::cout << "[ggmlc-run] Tokenized text '" << pair.first << "' (" << tokens.size() << " tokens)\n";
+        }
+
+        // Execute
+        executor.run(n_threads);
+        std::cout << "[ggmlc-run] Execution completed successfully.\n";
+
+        // Save output data to files if specified
+        for (const auto& pair : output_files) {
+            uint32_t tid = pair.first;
+            const void* data = executor.get_output_data(tid);
+            size_t sz = executor.get_tensor_size_bytes(tid);
+
+            std::ofstream fout(pair.second, std::ios::binary);
+            if (!fout.is_open()) {
+                std::cerr << "Failed to write output file: " << pair.second << "\n";
+                return 1;
+            }
+            fout.write(reinterpret_cast<const char*>(data), sz);
+            std::cout << "[ggmlc-run] Saved output tensor " << tid << " (" << sz << " bytes) to " << pair.second << "\n";
+        }
+
+        // Save state-out data
+        for (const auto& pair : state_out_files) {
+            const void* data = executor.get_state_data_by_name(pair.first);
+            size_t sz = 0;
+            for (const auto& t_pair : model_graph.tensors) {
+                if (t_pair.second.name == pair.first) {
+                    sz = executor.get_tensor_size_bytes(t_pair.first);
+                    break;
+                }
+            }
+            if (sz > 0) {
+                std::ofstream fout(pair.second, std::ios::binary);
+                if (!fout.is_open()) {
+                    std::cerr << "Failed to write state-out file: " << pair.second << "\n";
+                    return 1;
+                }
+                fout.write(reinterpret_cast<const char*>(data), sz);
+                std::cout << "[ggmlc-run] Saved state '" << pair.first << "' (" << sz << " bytes) to " << pair.second << "\n";
+            }
+        }
+
+        // Explicit Task-Aware Output Formatting (when no explicit output file requested)
+        if (output_files.empty() && !model_graph.outputs.empty()) {
+            uint32_t primary_out_tid = model_graph.outputs[0];
+            const float* out_f32 = static_cast<const float*>(executor.get_output_data(primary_out_tid));
+            size_t n_elem = executor.get_tensor_size_bytes(primary_out_tid) / sizeof(float);
+
+            if (model_graph.has_task("classification") || model_graph.has_task("image-classification")) {
+                // Compute Softmax and display Top-5
+                std::vector<std::pair<float, int>> ranked(n_elem);
+                float max_logit = -1e30f;
+                for (size_t i = 0; i < n_elem; ++i) {
+                    if (out_f32[i] > max_logit) max_logit = out_f32[i];
+                }
+                float sum_exp = 0.0f;
+                for (size_t i = 0; i < n_elem; ++i) {
+                    float exp_val = std::exp(out_f32[i] - max_logit);
+                    ranked[i] = {exp_val, static_cast<int>(i)};
+                    sum_exp += exp_val;
+                }
+                for (auto& p : ranked) p.first /= sum_exp;
+
+                std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+                    return a.first > b.first;
+                });
+
+                std::cout << "\n[ggmlc-run] Classification Results (Top 5):\n";
+                for (size_t k = 0; k < std::min<size_t>(5, ranked.size()); ++k) {
+                    std::cout << "  #" << (k + 1) << ": Class " << std::setw(5) << ranked[k].second
+                              << "  - " << std::fixed << std::setprecision(2) << (ranked[k].first * 100.0f) << "%\n";
+                }
+            } else if (model_graph.has_task("embedding") || model_graph.has_task("text-embedding")) {
+                // Compute L2 norm
+                double sum_sq = 0.0;
+                for (size_t i = 0; i < n_elem; ++i) {
+                    sum_sq += static_cast<double>(out_f32[i]) * out_f32[i];
+                }
+                double l2_norm = std::sqrt(sum_sq);
+                std::cout << "\n[ggmlc-run] Embedding Vector (dim=" << n_elem
+                          << ", L2 norm=" << std::fixed << std::setprecision(4) << l2_norm << "):\n  [";
+                for (size_t i = 0; i < std::min<size_t>(4, n_elem); ++i) {
+                    std::cout << std::setprecision(4) << out_f32[i] << ", ";
+                }
+                std::cout << "... (" << n_elem << " float32 elements)]\n";
+            } else if (model_graph.has_task("similarity")) {
+                float logit_val = out_f32[0];
+                std::cout << "\n[ggmlc-run] Similarity Logit: " << std::fixed << std::setprecision(4)
+                          << logit_val << "\n";
+            } else {
+                for (uint32_t out_id : model_graph.outputs) {
+                    size_t sz = executor.get_tensor_size_bytes(out_id);
+                    std::cout << "[ggmlc-run] Graph output tensor " << out_id << ": " << sz << " bytes computed.\n";
+                }
+            }
+        }
+
+    } catch (const std::exception& e) {
+        std::cerr << "[ggmlc-run ERROR] " << e.what() << "\n";
+        return 1;
+    }
+
+    return 0;
+}
