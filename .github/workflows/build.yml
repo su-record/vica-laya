@@ -31,18 +31,20 @@ jobs:
           # answers and CPU speed. Linux and Windows drop OpenMP (libgomp / VCOMP140). Linux links
           # libstdc++ / libgcc statically. Windows keeps the shared MSVC runtime and ships its DLLs
           # next to the exe: a static MSVC runtime changed CPU probabilities by up to 0.032.
+          # GGML_NATIVE=OFF everywhere: a native build crashed with "Illegal instruction" on another
+          # runner's CPU. x86_64 builds then target AVX2 / BMI2 / FMA / F16C.
           - name: macos-arm64
             os: macos-15
             flags: -DGGMLC_ENABLE_METAL=ON -DGGML_NATIVE=OFF
             reference_flags: ""
           - name: linux-x86_64
             os: ubuntu-22.04
-            flags: -DGGMLC_ENABLE_VULKAN=ON -DGGML_OPENMP=OFF "-DCMAKE_EXE_LINKER_FLAGS=-static-libstdc++ -static-libgcc"
-            reference_flags: -DGGMLC_ENABLE_VULKAN=ON
+            flags: -DGGMLC_ENABLE_VULKAN=ON -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF "-DCMAKE_EXE_LINKER_FLAGS=-static-libstdc++ -static-libgcc"
+            reference_flags: -DGGMLC_ENABLE_VULKAN=ON -DGGML_NATIVE=OFF
           - name: windows-x86_64
             os: windows-2022
-            flags: -DGGMLC_ENABLE_VULKAN=ON -DGGML_OPENMP=OFF
-            reference_flags: -DGGMLC_ENABLE_VULKAN=ON
+            flags: -DGGMLC_ENABLE_VULKAN=ON -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF
+            reference_flags: -DGGMLC_ENABLE_VULKAN=ON -DGGML_NATIVE=OFF
 
     steps:
       - uses: actions/checkout@v4

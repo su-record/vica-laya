@@ -10,6 +10,7 @@ downloads are published with the model on Hugging Face (`tory-labs/vica-laya`).
 | Linux x86_64 | Vulkan | `vica-laya-linux-x86_64.tar.gz` | Vulkan loader (`libvulkan.so.1`); built on Ubuntu 22.04 (glibc 2.35) |
 | Windows x86_64 | Vulkan | `vica-laya-windows-x86_64.zip` | Vulkan loader (`vulkan-1.dll`, installed with GPU drivers) |
 
+x86_64 builds need a CPU with AVX2, FMA and BMI2 (Intel Haswell 2013, AMD Excavator 2015 or later).
 `--device auto` uses the GPU when one is available and falls back to CPU otherwise. The Windows
 download carries the Microsoft Visual C++ runtime DLLs next to `vica-laya.exe`.
 
@@ -19,7 +20,8 @@ GitHub Actions (`.github/workflows/build.yml`) builds the three platforms, renam
 model to `vica-laya`, and packs the downloads with `SHA256SUMS` as workflow artifacts. Pushing a `v*`
 tag also attaches them to a GitHub release.
 
-Linux and Windows builds drop OpenMP; Linux also links libstdc++ and libgcc statically. Windows keeps
+Builds do not tune for the build machine's CPU (`GGML_NATIVE=OFF`). Linux and Windows builds drop
+OpenMP; Linux also links libstdc++ and libgcc statically. Windows keeps
 the shared Visual C++ runtime because a static one changed CPU probabilities by up to 0.032. Each run
 compares fixed CPU decisions and CPU speed with an upstream-style reference build; any changed
 decision fails the run.
