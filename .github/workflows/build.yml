@@ -13,11 +13,12 @@ permissions:
   contents: write
 
 env:
-  # Published model release. Pin a Hugging Face commit, not main.
-  MODEL_RELEASE: "2026.11.08.1"
-  MODEL_URL: https://huggingface.co/tory-labs/vica-laya/resolve/a476161f88e8f91737533595168e85d09dcb8e14/laya_multilingual_q8_0.gguf
-  MODEL_SHA256: ba398461a6181e68350d0a88cf7885f53925ce440d2e97f3ea0096e4d8d9a721
-  CHECK_FILES: https://huggingface.co/tory-labs/vica-laya/resolve/a476161f88e8f91737533595168e85d09dcb8e14
+  # Published model release. Pin a Hugging Face commit, not main. From 2026.11.13.1 the staged
+  # model is already named vica-laya; renaming it again sets only the release in its checkpoint.
+  MODEL_RELEASE: "2026.11.13.1"
+  MODEL_URL: https://huggingface.co/tory-labs/vica-laya/resolve/27561d9b5bc0ec06412d4ddd111f60eed970cfbb/vica-laya.gguf
+  MODEL_SHA256: c2d69b85ba80daf88f93c6e5bc6b5368d8d0491dcc1d85efeecdf1d5cb3df96e
+  CHECK_FILES: https://huggingface.co/tory-labs/vica-laya/resolve/27561d9b5bc0ec06412d4ddd111f60eed970cfbb
 
 jobs:
   build:
