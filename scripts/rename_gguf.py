@@ -37,5 +37,6 @@ before = {k: f.contents() for k, f in reader.fields.items() if not k.startswith(
 after = {k: f.contents() for k, f in out.fields.items() if not k.startswith("GGUF.")}
 assert before.keys() == after.keys(), before.keys() ^ after.keys()
 changed = sorted(k for k in before if before[k] != after[k])
-assert changed == expected, changed
-print(f"tensors identical: {len(a)}; metadata changed: {changed}")
+# A model staged with these names already (from release 2026.11.13.1) comes out unchanged.
+assert changed in (expected, []), changed
+print(f"tensors identical: {len(a)}; metadata changed: {changed or 'none, already named'}")
